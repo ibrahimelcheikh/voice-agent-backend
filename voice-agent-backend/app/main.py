@@ -7,11 +7,11 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
-    reservations, orders, faq, demo,
+    reservations, orders, faq, demo, livekit_webhooks,
 )
 from app.db.database import engine, Base
 from app.db.seed import seed_mock_data
@@ -88,15 +88,6 @@ async def configure_twilio_webhook():
         print(f"⚠️ Could not auto-configure Twilio: {e}")
 
 
-@app.websocket("/twilio/media-stream")
-async def media_stream(websocket: WebSocket):
-    """Twilio Media Streams WebSocket — receives raw call audio and runs the
-    STT → LLM → TTS loop, streaming Aria's voice back to the caller."""
-    await websocket.accept()
-    from app.agents.media_stream_handler import handle_media_stream
-    await handle_media_stream(websocket)
-
-
 # Routes
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
 app.include_router(agents.router, prefix="/agents", tags=["Agents"])
@@ -105,6 +96,7 @@ app.include_router(behavior.router, prefix="/behavior", tags=["Behavior Config"]
 app.include_router(campaigns.router, prefix="/campaigns", tags=["Campaigns"])
 app.include_router(whatsapp.router, prefix="/whatsapp", tags=["WhatsApp"])
 app.include_router(twilio_webhooks.router, prefix="/twilio", tags=["Twilio Webhooks"])
+app.include_router(livekit_webhooks.router, prefix="/livekit", tags=["LiveKit Webhooks"])
 app.include_router(reservations.router, prefix="/reservations", tags=["Reservations"])
 app.include_router(orders.router, prefix="/orders", tags=["Orders"])
 app.include_router(faq.router, prefix="/faq", tags=["FAQ"])

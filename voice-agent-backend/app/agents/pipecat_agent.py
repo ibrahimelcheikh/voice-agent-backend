@@ -1,189 +1,176 @@
 """
-Pipecat + LiveKit Voice Agent (production).
+LiveKit voice agent ("Aria") that joins a LiveKit room when a SIP call arrives.
 
-Pipeline:  LiveKit audio in -> STT -> LLM (+ tools) -> TTS -> LiveKit audio out
-  STT : OpenAI Whisper (Deepgram if a key is present)
-  LLM : gpt-4o-mini, system prompt assembled from the behavior config,
-        OpenAI function-calling wired to the Golden Fork action tools
-  TTS : OpenAI TTS using the agent's voice_id
-  VAD : Silero (turn detection)
+Flow:  Twilio number -> LiveKit SIP trunk -> LiveKit room -> this agent joins.
 
-Every heavy import is lazy and guarded so an incomplete pipecat/livekit install
-can never crash the API server — the agent simply runs in a safe fallback mode.
-The actual telephony bridge is exercised only on a live Twilio call.
+Built on the livekit-agents framework (AgentSession = STT -> LLM -> TTS with
+Silero VAD, barge-in, and turn detection built in). The Golden Fork action tools
+are wired as @function_tool methods so Aria can actually book/cancel/check
+reservations, take/check orders, answer FAQs, and transfer to a human.
+
+Triggered by the LiveKit `participant_joined` webhook (see
+app/api/routes/livekit_webhooks.py), which calls run_agent_in_room() in the
+background. For production scale you'd instead run this as a dedicated LiveKit
+worker (see run_worker() at the bottom) dispatched via the SIP dispatch rule.
 """
 import asyncio
 
 from app.core.config import settings
-from app.agents.tools import TOOL_SCHEMAS, execute_tool
+from app.agents.tools import execute_tool
+
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Aria, a friendly AI receptionist for the Golden Fork restaurant chain "
+    "(Downtown, Midtown, Uptown, Airport). Keep ALL responses under 2 sentences. Be "
+    "warm and professional. You can book tables, cancel reservations, check "
+    "reservations, take orders, answer menu/FAQ questions, and transfer to a human. "
+    "Always use your tools to take real actions."
+)
+GREETING = (
+    "Thank you for calling Golden Fork! I'm Aria, your AI assistant. "
+    "How can I help you today?"
+)
 
 
-def build_system_prompt(agent_config: dict) -> str:
-    """Assemble the LLM system prompt from a behavior config (hard rules,
-    blocked topics, escalation triggers, extraction fields)."""
-    prompt = agent_config.get("system_prompt") or "You are a helpful AI assistant."
-
-    hard = [r["rule"] for r in (agent_config.get("hard_rules") or []) if r.get("enabled")]
+def _build_system_prompt(behavior_config: dict) -> str:
+    prompt = behavior_config.get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+    hard = [r["rule"] for r in (behavior_config.get("hard_rules") or []) if r.get("enabled")]
     if hard:
-        prompt += "\n\nSTRICT RULES (never violate these):\n" + "\n".join(f"- {r}" for r in hard)
-
-    soft = [r["rule"] for r in (agent_config.get("soft_rules") or []) if r.get("enabled")]
-    if soft:
-        prompt += "\n\nGUIDELINES:\n" + "\n".join(f"- {r}" for r in soft)
-
-    blocked = agent_config.get("blocked_topics") or []
-    if blocked:
-        prompt += "\n\nNever discuss these topics: " + ", ".join(blocked) + "."
-
-    triggers = agent_config.get("escalation_triggers") or []
-    if triggers:
-        prompt += ("\n\nImmediately call transfer_to_human if any of these occur: "
-                   + ", ".join(triggers) + ".")
-
-    fields = agent_config.get("data_extraction_fields") or []
-    if fields:
-        prompt += ("\n\nDuring the conversation, naturally collect the following "
-                   "information when relevant: " + ", ".join(fields) + ".")
-
-    prompt += ("\n\nYou can take real actions using the provided tools (book/cancel/"
-               "check reservations, take orders, check order status, answer FAQs, "
-               "transfer to a human). Use them whenever the caller asks. Keep replies "
-               "short and natural for a phone conversation.")
+        prompt += "\n\nSTRICT RULES:\n" + "\n".join(f"- {r}" for r in hard)
     return prompt
 
 
-async def _make_tool_handler():
-    """Build a pipecat-style function handler that runs our DB tools."""
-    async def handler(function_name, tool_call_id, arguments, llm, context, result_callback):
-        _text, payload = await execute_tool(function_name, arguments or {})
-        await result_callback(payload)
-    return handler
+def _make_agent_class():
+    """Build the Agent subclass lazily so livekit-agents imports stay lazy."""
+    from livekit.agents import Agent, function_tool
+
+    class GoldenForkAgent(Agent):
+        def __init__(self, instructions: str):
+            super().__init__(instructions=instructions)
+
+        async def on_enter(self):
+            await self.session.say(GREETING, allow_interruptions=True)
+
+        @function_tool
+        async def create_reservation(self, customer_name: str, customer_phone: str,
+                                     party_size: int, date: str, time: str, location: str) -> str:
+            """Book a table. date is YYYY-MM-DD, time is HH:MM, location is one of
+            Downtown, Midtown, Uptown, Airport."""
+            text, _ = await execute_tool("create_reservation", {
+                "customer_name": customer_name, "customer_phone": customer_phone,
+                "party_size": party_size, "date": date, "time": time, "location": location})
+            return text
+
+        @function_tool
+        async def cancel_reservation(self, customer_phone: str = "", reservation_id: str = "") -> str:
+            """Cancel a reservation by phone number or reservation id."""
+            text, _ = await execute_tool("cancel_reservation", {
+                "customer_phone": customer_phone, "reservation_id": reservation_id})
+            return text
+
+        @function_tool
+        async def check_reservation(self, customer_phone: str) -> str:
+            """Look up the caller's upcoming reservation by phone number."""
+            text, _ = await execute_tool("check_reservation", {"customer_phone": customer_phone})
+            return text
+
+        @function_tool
+        async def answer_faq(self, question: str) -> str:
+            """Answer a common question (hours, parking, delivery, menu, policies)."""
+            text, _ = await execute_tool("answer_faq", {"question": question})
+            return text
+
+        @function_tool
+        async def take_order(self, customer_name: str, customer_phone: str,
+                            order_type: str, items: list[str], address: str = "") -> str:
+            """Place an order. order_type is delivery, pickup, or dine_in. items is a
+            list of menu item names. address is required for delivery."""
+            text, _ = await execute_tool("take_order", {
+                "customer_name": customer_name, "customer_phone": customer_phone,
+                "order_type": order_type, "address": address,
+                "items": [{"name": n, "qty": 1} for n in items]})
+            return text
+
+        @function_tool
+        async def check_order_status(self, customer_phone: str) -> str:
+            """Check the status of the caller's latest order by phone number."""
+            text, _ = await execute_tool("check_order_status", {"customer_phone": customer_phone})
+            return text
+
+        @function_tool
+        async def transfer_to_human(self, reason: str) -> str:
+            """Escalate to a human team member when the caller is upset or out of scope."""
+            text, _ = await execute_tool("transfer_to_human", {"reason": reason})
+            return text
+
+    return GoldenForkAgent
 
 
-async def run_voice_agent(room_name: str, agent_config: dict):
-    """Run the Pipecat voice agent inside a LiveKit room.
+def _build_session(behavior_config: dict):
+    from livekit.agents import AgentSession
+    from livekit.plugins import openai, silero
+    voice = behavior_config.get("voice_id") or "alloy"
+    key = settings.OPENAI_API_KEY
+    return AgentSession(
+        stt=openai.STT(model="whisper-1", api_key=key),
+        llm=openai.LLM(model="gpt-4o-mini", api_key=key),
+        tts=openai.TTS(voice=voice, model="tts-1", api_key=key),
+        vad=silero.VAD.load(),
+    )
 
-    Invoked as a background task when a Twilio call is bridged into `room_name`.
-    Never raises — any missing dependency degrades to fallback mode.
-    """
+
+async def run_agent_in_room(room_name: str, behavior_config: dict | None = None):
+    """Join a LiveKit room and run Aria until the call ends. Never raises."""
+    behavior_config = behavior_config or {}
     try:
-        from pipecat.pipeline.pipeline import Pipeline
-        from pipecat.pipeline.runner import PipelineRunner
-        from pipecat.pipeline.task import PipelineParams, PipelineTask
-        from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+        from livekit import rtc
+        from livekit.agents import RoomInputOptions
 
-        # Service import paths moved across pipecat versions — try both layouts.
-        try:
-            from pipecat.services.openai.llm import OpenAILLMService
-            from pipecat.services.openai.tts import OpenAITTSService
-            from pipecat.services.openai.stt import OpenAISTTService
-        except ImportError:  # older flat layout
-            from pipecat.services.openai import (
-                OpenAILLMService, OpenAITTSService, OpenAISTTService,
-            )
+        instructions = _build_system_prompt(behavior_config)
+        room = rtc.Room()
+        await room.connect(settings.LIVEKIT_URL, generate_agent_token(room_name))
+        print(f"[agent] connected to room: {room_name}")
 
-        from pipecat.transports.services.livekit import LiveKitTransport, LiveKitParams
-        from pipecat.audio.vad.silero import SileroVADAnalyzer
+        disconnected = asyncio.Event()
+        room.on("disconnected", lambda *_a: disconnected.set())
 
-        system_prompt = build_system_prompt(agent_config)
+        session = _build_session(behavior_config)
+        agent = _make_agent_class()(instructions)
+        await session.start(agent=agent, room=room, room_input_options=RoomInputOptions())
 
-        transport = LiveKitTransport(
-            url=settings.LIVEKIT_URL,
-            token=await generate_agent_token(room_name),
-            room_name=room_name,
-            params=LiveKitParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                vad_analyzer=SileroVADAnalyzer(),
-            ),
-        )
-
-        # STT — Deepgram if a key exists, otherwise OpenAI Whisper.
-        if settings.DEEPGRAM_API_KEY:
-            from pipecat.services.deepgram.stt import DeepgramSTTService
-            stt = DeepgramSTTService(api_key=settings.DEEPGRAM_API_KEY)
-        else:
-            stt = OpenAISTTService(api_key=settings.OPENAI_API_KEY)
-
-        llm = OpenAILLMService(api_key=settings.OPENAI_API_KEY, model="gpt-4o-mini")
-
-        # Register every tool with the LLM service for function calling.
-        handler = await _make_tool_handler()
-        for schema in TOOL_SCHEMAS:
-            try:
-                llm.register_function(schema["function"]["name"], handler)
-            except Exception:
-                pass
-
-        tts = OpenAITTSService(
-            api_key=settings.OPENAI_API_KEY,
-            voice=agent_config.get("voice_id", "alloy"),
-        )
-
-        # Tools schema for the context (try the modern ToolsSchema, fall back to raw).
-        try:
-            from pipecat.adapters.schemas.tools_schema import ToolsSchema
-            from pipecat.adapters.schemas.function_schema import FunctionSchema
-            fn_schemas = [
-                FunctionSchema(
-                    name=t["function"]["name"],
-                    description=t["function"]["description"],
-                    properties=t["function"]["parameters"]["properties"],
-                    required=t["function"]["parameters"].get("required", []),
-                )
-                for t in TOOL_SCHEMAS
-            ]
-            tools = ToolsSchema(standard_tools=fn_schemas)
-        except Exception:
-            tools = TOOL_SCHEMAS
-
-        messages = [{"role": "system", "content": system_prompt}]
-        context = OpenAILLMContext(messages, tools)
-        context_aggregator = llm.create_context_aggregator(context)
-
-        pipeline = Pipeline([
-            transport.input(),
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ])
-
-        max_dur = agent_config.get("max_call_duration", 480)
-        task = PipelineTask(pipeline, PipelineParams(allow_interruptions=True))
-
-        runner = PipelineRunner(handle_sigint=False)
-
-        # Enforce the configured max call duration.
-        async def _runner():
-            await runner.run(task)
-
-        try:
-            await asyncio.wait_for(_runner(), timeout=max_dur + 30)
-        except asyncio.TimeoutError:
-            print(f"[voice-agent] room {room_name} hit max duration, ending gracefully")
-            try:
-                await task.cancel()
-            except Exception:
-                pass
-
-    except ImportError as e:
-        print(f"[voice-agent] pipecat/livekit not fully available ({e}); fallback mode for room {room_name}")
-        await asyncio.sleep(1)
-    except Exception as e:  # never let a background task take down the server
-        print(f"[voice-agent] error in room {room_name}: {type(e).__name__}: {e}")
-        await asyncio.sleep(1)
+        await disconnected.wait()
+        print(f"[agent] call ended, leaving room: {room_name}")
+        await session.aclose()
+    except Exception as e:
+        print(f"[agent] error in room {room_name}: {type(e).__name__}: {e}")
 
 
-async def generate_agent_token(room_name: str) -> str:
-    """Generate a LiveKit JWT for the agent to join the room."""
+def generate_agent_token(room_name: str) -> str:
     from livekit import api
     token = (
         api.AccessToken(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET)
-        .with_identity("ai-agent")
-        .with_name("AI Agent")
+        .with_identity("aria-agent")
+        .with_name("Aria")
         .with_grants(api.VideoGrants(room_join=True, room=room_name))
     )
     return token.to_jwt()
+
+
+# ── Recommended production path: dedicated LiveKit worker ────────────────────
+# Instead of the webhook spawning agents, run a worker that LiveKit dispatches
+# jobs to (set room_config.agents=[RoomAgentDispatch(agent_name="aria")] on the
+# dispatch rule). Deploy as a separate process:  python -m app.agents.pipecat_agent
+async def _entrypoint(ctx):
+    from livekit.agents import RoomInputOptions
+    await ctx.connect()
+    session = _build_session({})
+    agent = _make_agent_class()(DEFAULT_SYSTEM_PROMPT)
+    await session.start(agent=agent, room=ctx.room, room_input_options=RoomInputOptions())
+
+
+def run_worker():
+    from livekit.agents import cli, WorkerOptions
+    cli.run_app(WorkerOptions(entrypoint_fnc=_entrypoint, agent_name="aria"))
+
+
+if __name__ == "__main__":
+    run_worker()

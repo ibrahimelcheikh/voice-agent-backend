@@ -52,7 +52,45 @@ clean demo database:
 
 ---
 
-## Connect Real Phone Calls (Twilio + ngrok)
+## Phone Calls via LiveKit SIP (Twilio → LiveKit → Agent)
+
+Architecture: **Twilio number → LiveKit SIP trunk → LiveKit room → Aria agent joins**.
+
+These are one-time, account-level steps (cannot be done from app code alone):
+
+1. **Env vars** — ensure `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`,
+   `TWILIO_PHONE_NUMBER`, and `PUBLIC_URL` are set (locally in `.env`, on Railway
+   in the Variables tab).
+
+2. **Create the SIP trunk + dispatch rule** (run once):
+   ```
+   python scripts/setup_livekit_sip.py
+   ```
+   It prints the LiveKit SIP host and the URLs to use below.
+
+3. **Set the LiveKit webhook** — LiveKit Dashboard → Settings → Webhooks → add:
+   ```
+   https://voice-agent-backend-production-fa4e.up.railway.app/livekit/webhook
+   ```
+   This is what triggers the agent to join each call.
+
+4. **Point Twilio at LiveKit** — two options:
+   - **A (no change to Twilio number):** keep the Voice webhook on
+     `{PUBLIC_URL}/twilio/inbound`. It now returns `<Dial><Sip>` TwiML that dials
+     the call into LiveKit's SIP host.
+   - **B (Elastic SIP Trunk):** in Twilio, create an Origination URI
+     `sip:<project>.sip.livekit.cloud;transport=tcp` and attach the number.
+
+5. **Call the number.** Flow: Twilio → LiveKit SIP → `call-*` room → Aria joins
+   with VAD, barge-in, natural turns, and the booking/order/FAQ tools.
+
+> Verify the exact SIP host in LiveKit Dashboard → Settings → SIP — the app
+> derives `<project>.sip.livekit.cloud` from `LIVEKIT_URL`, which is correct for
+> standard LiveKit Cloud projects.
+
+---
+
+## Legacy: Twilio Media Streams (ngrok)
 
 ### Step 1: Start ngrok in a NEW terminal
 ```
