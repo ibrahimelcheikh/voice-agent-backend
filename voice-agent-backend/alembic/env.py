@@ -20,8 +20,8 @@ import app.models.models  # noqa: E402,F401  (register every model on Base.metad
 # access to the values within the .ini file in use.
 config = context.config
 
-# Pull the database URL from application settings (async asyncpg driver).
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+# Pull the database URL from application settings (normalized to asyncpg driver).
+config.set_main_option("sqlalchemy.url", settings.async_database_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
