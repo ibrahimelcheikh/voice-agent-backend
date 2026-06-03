@@ -1,45 +1,22 @@
-# Pinned to the versions verified working in this environment.
-# NOTE: pipecat-ai/livekit moved to their 1.x / 0.0.7x lines — do NOT downgrade to
-# the old 0.0.47 / 0.11 pins, those no longer build cleanly on Windows.
-
-# Web framework
-fastapi==0.135.2
-uvicorn[standard]==0.42.0
-
-# Database
-sqlalchemy==2.0.48
-alembic==1.18.4
-asyncpg==0.31.0
-
-# Validation / settings
-pydantic==2.12.5
-pydantic-settings==2.13.1
-
-# Auth
-python-jose[cryptography]==3.5.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
-python-multipart==0.0.22
-python-dotenv==1.2.2
-
-# HTTP
-httpx==0.28.1
-
-# Twilio
-twilio==9.10.4
-
-# LiveKit (1.x)
-livekit==1.1.3
-livekit-api==1.1.0
-livekit-agents==1.5.1
-
-# Pipecat (0.0.7x) — install the voice extras if running real calls:
-#   pip install "pipecat-ai[openai,silero,livekit]==0.0.73"
-pipecat-ai==0.0.73
-
-# OpenAI
-openai==2.29.0
-
-# Audio / streaming
-websockets==15.0.1
-aiohttp==3.13.3
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+asyncpg
+psycopg2-binary
+pydantic
+pydantic-settings
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt
+python-multipart
+python-dotenv
+httpx
+twilio
+livekit
+livekit-api
+livekit-agents
+pipecat-ai
+openai
+websockets
+aiohttp
