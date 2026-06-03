@@ -84,6 +84,24 @@ These are one-time, account-level steps (cannot be done from app code alone):
 5. **Call the number.** Flow: Twilio → LiveKit SIP → `call-*` room → Aria joins
    with VAD, barge-in, natural turns, and the booking/order/FAQ tools.
 
+### How the agent joins the room — pick ONE
+
+The room is created by the dispatch rule; something must put Aria in it. Three
+triggers exist; **enable only one path** or you'll get two agents per call:
+
+- **Room watcher (default, simplest).** The web service polls LiveKit every 2s
+  for new `call-*` rooms and joins an agent. Controlled by `ENABLE_ROOM_WATCHER`
+  (default `true`). No webhook or second service needed. Good for the demo.
+- **LiveKit webhook.** If you set the dashboard webhook (step 3), `participant_joined`
+  also spawns the agent. Safe alongside the watcher (join is idempotent per room).
+- **Dedicated worker (production).** Run a separate process/Railway service:
+  ```
+  python -m app.agents.agent_worker start
+  ```
+  This is the canonical livekit-agents architecture (the worker auto-joins each
+  new room). When you use it, set `ENABLE_ROOM_WATCHER=false` on the web service
+  so the agent isn't started twice.
+
 > Verify the exact SIP host in LiveKit Dashboard → Settings → SIP — the app
 > derives `<project>.sip.livekit.cloud` from `LIVEKIT_URL`, which is correct for
 > standard LiveKit Cloud projects.

@@ -118,9 +118,18 @@ def _build_session(behavior_config: dict):
     )
 
 
+# Rooms currently being handled in THIS process — guards against the webhook and
+# the room watcher both spawning an agent into the same room (double-join).
+_active_rooms: set[str] = set()
+
+
 async def run_agent_in_room(room_name: str, behavior_config: dict | None = None):
-    """Join a LiveKit room and run Aria until the call ends. Never raises."""
+    """Join a LiveKit room and run Aria until the call ends. Never raises.
+    Idempotent per room within this process."""
     behavior_config = behavior_config or {}
+    if room_name in _active_rooms:
+        return
+    _active_rooms.add(room_name)
     try:
         from livekit import rtc
         from livekit.agents import RoomInputOptions
@@ -142,6 +151,8 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None)
         await session.aclose()
     except Exception as e:
         print(f"[agent] error in room {room_name}: {type(e).__name__}: {e}")
+    finally:
+        _active_rooms.discard(room_name)
 
 
 def generate_agent_token(room_name: str) -> str:
@@ -160,16 +171,17 @@ def generate_agent_token(room_name: str) -> str:
 # jobs to (set room_config.agents=[RoomAgentDispatch(agent_name="aria")] on the
 # dispatch rule). Deploy as a separate process:  python -m app.agents.pipecat_agent
 async def _entrypoint(ctx):
-    from livekit.agents import RoomInputOptions
-    await ctx.connect()
+    from livekit.agents import RoomInputOptions, AutoSubscribe
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     session = _build_session({})
     agent = _make_agent_class()(DEFAULT_SYSTEM_PROMPT)
     await session.start(agent=agent, room=ctx.room, room_input_options=RoomInputOptions())
 
 
 def run_worker():
+    # No agent_name -> automatic dispatch: the worker joins every new room.
     from livekit.agents import cli, WorkerOptions
-    cli.run_app(WorkerOptions(entrypoint_fnc=_entrypoint, agent_name="aria"))
+    cli.run_app(WorkerOptions(entrypoint_fnc=_entrypoint))
 
 
 if __name__ == "__main__":
