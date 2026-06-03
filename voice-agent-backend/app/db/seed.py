@@ -14,12 +14,21 @@ from app.models.models import (
     AgentType, AgentStatus, CallDirection, CallOutcome, CampaignStatus,
     ReservationStatus, OrderType, OrderStatus,
 )
-from passlib.context import CryptContext
 from datetime import datetime, timedelta, date
 import random
 import uuid
+import bcrypt
 
-pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def safe_hash(password: str) -> str:
+    """Hash a password with bcrypt, guarding the 72-byte limit.
+
+    Uses the bcrypt library directly (not passlib) — passlib 1.7.4's bcrypt
+    backend runs a self-test that hashes >72-byte strings and crashes on
+    newer bcrypt releases with "password cannot be longer than 72 bytes".
+    """
+    pw = password.encode("utf-8")[:72]
+    return bcrypt.hashpw(pw, bcrypt.gensalt()).decode("utf-8")
 
 LOCATIONS = ["Downtown", "Midtown", "Uptown", "Airport"]
 NAMES = [
@@ -65,7 +74,7 @@ async def seed_mock_data():
 
 def _seed_core(db):
     db.add(User(id="usr-admin-001", name="Ibrahim Admin",
-                email="admin@primetechai.com", password_hash=pwd.hash("demo1234")))
+                email="admin@primetechai.com", password_hash=safe_hash("demo1234")))
 
     inbound_config = BehaviorConfig(
         id="cfg-inbound-001",
