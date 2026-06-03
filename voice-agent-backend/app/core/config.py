@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     APP_PORT: int = 8030
     DEBUG: bool = True
     NGROK_URL: str = ""
-    PUBLIC_URL: str = "https://stiffen-caterer-lying.ngrok-free.dev"  # public base for Twilio webhooks + media stream
+    PUBLIC_URL: str = "https://voice-agent-backend-production-fa4e.up.railway.app"  # public base for Twilio webhooks + media stream
     RESET_DB: bool = False  # set true to drop+reseed a fresh demo DB on next boot
 
     @property
