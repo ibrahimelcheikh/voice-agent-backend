@@ -17,10 +17,66 @@ The LLM is forbidden from inventing appointment times, prices, doctor names, pol
 or insurance details — it is only a natural-language formatter of the brain's data.
 """
 import json
+import logging
+import re
+import time
+from datetime import date, timedelta
 
 from app.agents.clinic_functions import CLINIC_FUNCTIONS
 
+logger = logging.getLogger("clinic-agent.guardrail")
+
 LANGUAGES = {"en": "English", "ar": "Arabic", "fr": "French", "es": "Spanish"}
+
+# Classifier OpenAI call timeout (s). Without this a hung classify call leaves the
+# agent silent mid-call (on_user_turn_completed awaits it forever).
+_CLASSIFY_TIMEOUT = 8.0
+
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_iso_date(v) -> bool:
+    if not isinstance(v, str) or not _ISO_RE.match(v):
+        return False
+    try:
+        date.fromisoformat(v)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_relative_date(text: str, today_iso: str) -> str | None:
+    """Deterministically convert a relative date phrase in `text` to an ISO date, so the
+    agent never has to ask the caller for a calendar date. Handles today/tonight,
+    tomorrow, day after tomorrow, '(this|next) <weekday>', a bare <weekday>, and
+    'next week'. Returns YYYY-MM-DD or None if no relative phrase is found."""
+    try:
+        today = date.fromisoformat(today_iso)
+    except (ValueError, TypeError):
+        return None
+    t = text.lower()
+    if "day after tomorrow" in t:
+        return (today + timedelta(days=2)).isoformat()
+    if "tomorrow" in t:
+        return (today + timedelta(days=1)).isoformat()
+    if "today" in t or "tonight" in t:
+        return today.isoformat()
+    for name, wd in _WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", t):
+            base = (wd - today.weekday()) % 7
+            days = base or 7  # next future occurrence — a named weekday never means today
+            if "next" in t and base != 0:
+                days += 7      # "next <weekday>" = the one a full week on
+            return (today + timedelta(days=days)).isoformat()
+    if "next week" in t:
+        return (today + timedelta(days=7)).isoformat()
+    return None
 
 INTENTS = [
     "book_appointment", "cancel_appointment", "reschedule_appointment",
@@ -82,6 +138,11 @@ class GuardrailBrain:
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
         self._today = today
+        # Human-readable today (with weekday) so the classifier can compute "next Monday".
+        try:
+            self._today_human = date.fromisoformat(today).strftime("%A, %B %d, %Y")
+        except (ValueError, TypeError):
+            self._today_human = today
         self._max_unclear = max_unclear
 
         self.entities: dict = {}
@@ -98,14 +159,20 @@ class GuardrailBrain:
         Returns {instruction, intent, data, end (reason|None), transfer (bool)}.
         Never raises — on error it returns a safe "connect to staff" instruction.
         """
+        t0 = time.perf_counter()
         try:
             intent, extracted, language = await self._classify(user_text)
         except Exception as e:
-            print(f"[guardrail] classify error: {type(e).__name__}: {e}")
+            logger.error("❌ classify error after %.0fms: %s: %s",
+                         (time.perf_counter() - t0) * 1000, type(e).__name__, e)
+            # Don't transfer on a transient classify failure — ask the caller to repeat.
             return {"instruction": self._wrap(
                 last_assistant,
-                {"instruction_text": "Apologise briefly and say you'll connect them with our staff who can help."}),
-                "intent": "unclear", "data": {}, "end": None, "transfer": True}
+                {"instruction_text": "There was a brief delay. Apologise in one short sentence "
+                                     "and ask the caller to please repeat that."}),
+                "intent": "unclear", "data": {}, "end": None, "transfer": False}
+        logger.info("🧭 intent=%s lang=%s entities=%s in %.0fms",
+                    intent, language, extracted, (time.perf_counter() - t0) * 1000)
 
         if not self._language_locked and language in LANGUAGES:
             self.language = language
@@ -114,6 +181,15 @@ class GuardrailBrain:
         for k in _ENTITY_KEYS:
             if extracted.get(k):
                 self.entities[k] = extracted[k]
+
+        # Deterministic relative-date resolution — so we never ask the caller for a
+        # calendar date even if the classifier left it relative/blank.
+        resolved = _resolve_relative_date(user_text, self._today)
+        if resolved:
+            field = "new_date" if intent == "reschedule_appointment" else "date"
+            if not _is_iso_date(self.entities.get(field)):
+                self.entities[field] = resolved
+                logger.info("📅 resolved relative date -> %s (field=%s)", resolved, field)
 
         if intent == "end_call":
             return {"instruction": self._wrap(last_assistant,
@@ -145,10 +221,15 @@ class GuardrailBrain:
         data = {}
         if func:
             kwargs = {k: self.entities.get(k) for k in _FUNCTION_ARGS.get(intent, [])}
+            tf = time.perf_counter()
             try:
                 data = await func(**kwargs)
+                logger.info("🔧 fn %s args=%s -> %s in %.0fms", intent, kwargs,
+                            (list(data)[:6] if isinstance(data, dict) else type(data).__name__),
+                            (time.perf_counter() - tf) * 1000)
             except Exception as e:
-                print(f"[guardrail] function {intent} error: {type(e).__name__}: {e}")
+                logger.error("❌ function %s error after %.0fms: %s: %s", intent,
+                             (time.perf_counter() - tf) * 1000, type(e).__name__, e)
                 data = {}
 
         payload = {"intent": intent, "data": data}
@@ -160,10 +241,12 @@ class GuardrailBrain:
 
     async def _classify(self, user_text: str):
         sys = (
-            f"You route a medical-clinic phone call. Today is {self._today}. "
-            "Classify the caller's latest message into exactly one intent and extract entities. "
-            "Resolve relative dates/times (e.g. 'tomorrow', 'next Monday at 3pm') into absolute "
-            "YYYY-MM-DD and 24h HH:MM. Detect the spoken language (en/ar/fr/es). "
+            f"You route a medical-clinic phone call. Today is {self._today_human} "
+            f"({self._today}). Classify the caller's latest message into exactly one intent "
+            "and extract entities. ALWAYS compute relative dates yourself from today's date — "
+            "'tomorrow', 'this Friday', 'next Monday at 3pm', 'next week' — into absolute "
+            "YYYY-MM-DD and 24h HH:MM. NEVER leave a date relative and never expect the caller "
+            "to give a calendar date. Detect the spoken language (en/ar/fr/es). "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
         resp = await self._client.chat.completions.create(
@@ -174,6 +257,7 @@ class GuardrailBrain:
             tool_choice={"type": "function", "function": {"name": "route_intent"}},
             temperature=0,
             max_tokens=300,
+            timeout=_CLASSIFY_TIMEOUT,
         )
         call = resp.choices[0].message.tool_calls[0]
         args = json.loads(call.function.arguments or "{}")
@@ -189,7 +273,9 @@ class GuardrailBrain:
             "You are the AI receptionist for a medical clinic. You may ONLY use the information "
             "provided below. NEVER invent appointment times, prices, doctor names, policies, or "
             "insurance details. If the data is empty or a request failed, apologise briefly and "
-            "offer to connect them to staff. "
+            "offer to connect them to staff. When a date is already known, confirm it back to the "
+            "caller (e.g. 'Monday, June 9') — NEVER ask the caller to provide a calendar date; "
+            "relative dates like 'next Monday' are already resolved for you. "
             f"Reply in {lang_name}, in 1-2 short, warm, professional sentences. Do not greet again."
         )
         if last_assistant:
