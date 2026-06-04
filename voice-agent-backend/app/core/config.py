@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     NGROK_URL: str = ""
     PUBLIC_URL: str = "https://voice-agent-backend-production-fa4e.up.railway.app"  # public base for Twilio webhooks + media stream
     RESET_DB: bool = False  # set true to drop+reseed a fresh demo DB on next boot
+    FORCE_SEED: bool = False  # set true to wipe + reseed once (e.g. on Railway); same effect as RESET_DB
 
     @property
     def async_database_url(self) -> str:

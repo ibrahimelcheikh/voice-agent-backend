@@ -5,7 +5,7 @@ Seeds: admin user, the clinic behavior lock config, inbound + WhatsApp agents,
 the clinic, 5 doctors, 8 services, 6 insurance providers, 60 patients,
 100 appointments (past + upcoming), and ~40 call records with clinic transcripts.
 """
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from app.db.database import AsyncSessionLocal
 from app.models.models import (
     User, Agent, BehaviorConfig, Campaign, Call,
@@ -92,8 +92,19 @@ def _phone():
 
 async def seed_mock_data():
     async with AsyncSessionLocal() as db:
-        if (await db.execute(select(User))).scalars().first():
-            return  # already seeded
+        # Guard on appointments, NOT users: an earlier/partial deploy (or the old
+        # restaurant-era schema) can leave a stale User row that made the old
+        # `if User exists: return` guard skip seeding forever, leaving clinic data
+        # empty. If there are real appointments, the demo data is present — skip.
+        if (await db.execute(select(Appointment))).scalars().first():
+            print("[seed] Data already present (appointments exist) — skipping")
+            return
+
+        print("[seed] No appointments found — seeding fresh clinic data...")
+        # Clear any stale/partial seed rows first so the fixed-ID inserts below
+        # (usr-admin-001, agt-001, clinic-001, …) can't collide with leftovers.
+        # Safe: we only reach here when zero appointments exist, so nothing real is lost.
+        await _clear_seed_tables(db)
 
         _seed_core(db)
         _seed_clinic(db)
@@ -107,6 +118,19 @@ async def seed_mock_data():
         await db.commit()
         print("[seed] Prime Health Clinic demo seeded "
               "(5 doctors · 8 services · 60 patients · 100 appointments · 6 insurers)")
+
+
+async def _clear_seed_tables(db):
+    """Delete existing rows from every table the seed writes, in FK-safe order
+    (children before parents). Idempotent and only invoked when no appointments
+    exist, so it never destroys live data."""
+    for model in (
+        Appointment, WhatsAppMessage, WhatsAppConversation, Call, Campaign,
+        Patient, Service, Doctor, InsuranceProvider, Clinic,
+        Agent, BehaviorConfig, User,
+    ):
+        await db.execute(delete(model))
+    await db.flush()
 
 
 def _seed_core(db):

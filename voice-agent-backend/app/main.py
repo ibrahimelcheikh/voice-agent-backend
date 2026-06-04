@@ -13,7 +13,7 @@ from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
     appointments, patients, clinic_info, demo, livekit_webhooks,
 )
-from app.db.database import engine, Base
+from app.db.database import engine, Base, reset_schema
 from app.db.seed import seed_mock_data
 from app.core.config import settings
 import app.models.models  # noqa: F401  (ensure all models are registered on Base)
@@ -53,12 +53,19 @@ async def startup():
     # Create tables only if they don't already exist — never drop. Data persists
     # across restarts; seed runs once on the first-ever boot (see seed guard).
     # Set RESET_DB=true in .env to deliberately wipe and reseed a fresh demo DB.
-    async with engine.begin() as conn:
-        if settings.RESET_DB:
-            await conn.run_sync(Base.metadata.drop_all)
-            print("DB reset — all tables dropped (RESET_DB=true)")
-        await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+    # FORCE_SEED behaves like RESET_DB — a one-shot full wipe + reseed. Set it on
+    # Railway for a single deploy to rebuild an empty/stale DB, then unset it. The wipe
+    # drops the whole schema (clears orphan tables from the old restaurant schema that
+    # a model-only drop_all can't remove); the normal path only creates missing tables.
+    if settings.RESET_DB or settings.FORCE_SEED:
+        await reset_schema()
+        print(f"DB reset — public schema dropped + recreated (RESET_DB={settings.RESET_DB} FORCE_SEED={settings.FORCE_SEED})")
+    else:
+        async with engine.begin() as conn:
+            await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+    print("Checking if seed needed...")
     await seed_mock_data()
+    print("Seed check complete")
     await configure_twilio_webhook()
 
     # Generate prerecorded greeting/goodbye/thinking clips (once) for fast call start.
