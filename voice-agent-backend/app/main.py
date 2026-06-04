@@ -68,12 +68,9 @@ async def startup():
     except Exception as e:
         print(f"⚠️ Could not prepare audio clips: {e}")
 
-    # Fallback to the LiveKit webhook: poll for new SIP call rooms and join an
-    # agent. Needs LiveKit creds; skip if running the dedicated agent_worker.
-    if settings.ENABLE_ROOM_WATCHER and settings.LIVEKIT_API_KEY:
-        import asyncio
-        asyncio.create_task(agent_room_watcher())
-        print("[watcher] room watcher started")
+    # NOTE: This web service does NOT spawn voice agents. The dedicated worker
+    # process (`python -m app.agents.agent_worker`, a separate Railway service) is
+    # the ONLY thing that joins call rooms — exactly one agent per call.
 
     print("=" * 60)
     print("  Prime Tech AI — Voice Agent API is READY")
@@ -81,39 +78,6 @@ async def startup():
     print("  Health: http://localhost:8030/health")
     print("  Demo login: admin@primetechai.com / demo1234")
     print("=" * 60)
-
-
-async def agent_room_watcher():
-    """Poll LiveKit every 2s for new `call-*` rooms with a caller present, and
-    spawn the Aria agent into them. Webhook-independent fallback so calls connect
-    even if the LiveKit webhook isn't configured. run_agent_in_room is idempotent
-    per room, so this is safe alongside the webhook."""
-    import asyncio
-    from livekit import api as lkapi
-    from app.agents.clinic_agent import run_agent_in_room
-
-    handled_rooms: set[str] = set()
-    lk = lkapi.LiveKitAPI(
-        url=settings.LIVEKIT_URL.replace("wss://", "https://"),
-        api_key=settings.LIVEKIT_API_KEY,
-        api_secret=settings.LIVEKIT_API_SECRET,
-    )
-    try:
-        while True:
-            try:
-                rooms = await lk.room.list_rooms(lkapi.ListRoomsRequest())
-                for room in rooms.rooms:
-                    if (room.name.startswith("call-")
-                            and room.name not in handled_rooms
-                            and room.num_participants > 0):
-                        handled_rooms.add(room.name)
-                        print(f"[watcher] new call room {room.name} — spawning agent")
-                        asyncio.create_task(run_agent_in_room(room.name, {}))
-            except Exception as e:
-                print(f"[watcher] error: {type(e).__name__}: {e}")
-            await asyncio.sleep(2)
-    finally:
-        await lk.aclose()
 
 
 async def configure_twilio_webhook():

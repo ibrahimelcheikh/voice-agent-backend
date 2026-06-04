@@ -20,8 +20,6 @@ class Settings(BaseSettings):
     NGROK_URL: str = ""
     PUBLIC_URL: str = "https://voice-agent-backend-production-fa4e.up.railway.app"  # public base for Twilio webhooks + media stream
     RESET_DB: bool = False  # set true to drop+reseed a fresh demo DB on next boot
-    ENABLE_ROOM_WATCHER: bool = True  # poll LiveKit for new call rooms and auto-join an agent
-                                      # set false when running the dedicated agent_worker process
 
     @property
     def async_database_url(self) -> str:

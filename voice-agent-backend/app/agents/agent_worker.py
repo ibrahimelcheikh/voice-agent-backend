@@ -14,9 +14,10 @@ every new room; `_request_fnc` accepts only `call-*` rooms (the SIP dispatch rul
 prefix) and rejects the rest. Each accepted job runs `clinic_agent.entrypoint`, which
 connects to the room and runs the full guarded AgentSession.
 
-Deployment note: the main web service already runs an in-process room watcher
-(ENABLE_ROOM_WATCHER) that joins call rooms itself, so a separate worker process is
-OPTIONAL. Run EITHER this worker OR the room watcher, not both, or two agents join.
+Deployment note: this worker is the ONLY thing that joins call rooms. The main web
+service (uvicorn) serves the REST API only and spawns NO agents, guaranteeing exactly
+one agent per call. Run this as a single, separate Railway service — never two copies,
+or two agents would answer the same call.
 
 Explicit dispatch alternative: give WorkerOptions an `agent_name="clinic-agent"` and add
 `RoomConfiguration(agents=[RoomAgentDispatch(agent_name="clinic-agent")])` to the SIP

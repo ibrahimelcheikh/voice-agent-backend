@@ -11,17 +11,27 @@ framework. The anti-hallucination guardrail is preserved by overriding
 responds) we classify intent, fetch REAL data from the DB via GuardrailBrain, and
 inject a strict instruction so the LLM may ONLY state that data.
 
-Two ways in, both land on `_serve`:
+The dedicated worker is the ONLY agent-spawn path:
   * entrypoint(ctx)              — dedicated worker (agent_worker.py); uses ctx.connect()
-  * run_agent_in_room(room,...)  — in-process room watcher / LiveKit webhook; connects
-                                   a livekit.rtc.Room manually (single Railway service,
-                                   no separate worker process needed)
+The web service spawns no agents, so exactly one agent answers each call.
+
+`run_agent_in_room(room,...)` remains as a manual/standalone utility (connects a
+livekit.rtc.Room directly) but is no longer wired to any in-process trigger. It
+includes a cross-process guard so it never double-joins a room the worker is in.
 """
 import asyncio
+import uuid
 from datetime import datetime, date
 
 from app.core.config import settings
 from app.agents.guardrail import GuardrailBrain
+
+# Unique-per-process agent identity. Every agent participant identity starts with
+# "clinic-agent" so the double-join guard can detect an agent that is already in a
+# room, while the random suffix keeps each worker instance distinct.
+AGENT_IDENTITY_PREFIX = "clinic-agent"
+_WORKER_ID = uuid.uuid4().hex[:8]
+AGENT_IDENTITY = f"{AGENT_IDENTITY_PREFIX}-{_WORKER_ID}"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a clinic receptionist AI. You may ONLY state information provided to you in "
@@ -42,12 +52,35 @@ def generate_agent_token(room_name: str) -> str:
     from livekit import api
     token = (
         api.AccessToken(settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET)
-        .with_identity("clinic-agent")
+        .with_identity(AGENT_IDENTITY)
         .with_name("Clinic Assistant")
         .with_grants(api.VideoGrants(
             room_join=True, room=room_name, can_publish=True, can_subscribe=True))
     )
     return token.to_jwt()
+
+
+async def _agent_already_in_room(room_name: str) -> bool:
+    """True if a participant whose identity starts with the agent prefix is already
+    in the room. Cross-process double-join guard: prevents a second agent (e.g. the
+    dedicated worker AND a stray in-process join) from both answering one call."""
+    try:
+        from livekit import api as lkapi
+        lk = lkapi.LiveKitAPI(
+            url=settings.LIVEKIT_URL.replace("wss://", "https://"),
+            api_key=settings.LIVEKIT_API_KEY,
+            api_secret=settings.LIVEKIT_API_SECRET,
+        )
+        try:
+            res = await lk.room.list_participants(
+                lkapi.ListParticipantsRequest(room=room_name))
+            return any((p.identity or "").startswith(AGENT_IDENTITY_PREFIX)
+                       for p in res.participants)
+        finally:
+            await lk.aclose()
+    except Exception as e:
+        print(f"[agent] participant check failed: {type(e).__name__}: {e}")
+        return False
 
 
 def _build_stt():
@@ -174,7 +207,17 @@ async def entrypoint(ctx):
     from livekit.agents import AutoSubscribe
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     room_name = ctx.room.name
-    print(f"[worker] connected to room {room_name}")
+
+    # Double-join guard: if another agent participant is already in this room, bail
+    # out so only one agent ever answers a call.
+    others = [p for p in ctx.room.remote_participants.values()
+              if (getattr(p, "identity", "") or "").startswith(AGENT_IDENTITY_PREFIX)]
+    if others:
+        print(f"[worker] agent already in {room_name} ({others[0].identity}); skipping join")
+        await ctx.room.disconnect()
+        return
+
+    print(f"[worker] connected to room {room_name} as {AGENT_IDENTITY}")
     agent_row, behavior_config = await _load_behavior()
     call_id = await _create_call_record(agent_row, room_name, None)
     await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True)
@@ -187,12 +230,17 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
     Idempotent per room within this process."""
     if room_name in _active_rooms:
         return
+    # Cross-process double-join guard: don't join if an agent is already in the room
+    # (e.g. the dedicated worker has already answered this call).
+    if await _agent_already_in_room(room_name):
+        print(f"[agent] agent already present in {room_name}; not joining")
+        return
     _active_rooms.add(room_name)
     try:
         from livekit import rtc
         room = rtc.Room()
         await room.connect(settings.LIVEKIT_URL, generate_agent_token(room_name))
-        print(f"[agent] connected to room {room_name}")
+        print(f"[agent] connected to room {room_name} as {AGENT_IDENTITY}")
         await _serve(room, behavior_config or {}, call_id, datetime.utcnow(), is_worker=False)
     except Exception as e:
         print(f"[agent] error in room {room_name}: {type(e).__name__}: {e}")
