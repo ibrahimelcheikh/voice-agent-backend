@@ -20,11 +20,31 @@ livekit.rtc.Room directly) but is no longer wired to any in-process trigger. It
 includes a cross-process guard so it never double-joins a room the worker is in.
 """
 import asyncio
+import os
 import uuid
 from datetime import datetime, date
 
 from app.core.config import settings
 from app.agents.guardrail import GuardrailBrain
+
+
+def _log(msg: str) -> None:
+    """Single logging surface so every pipeline step is visible in Railway logs.
+    flush=True so lines appear immediately even under buffered stdout."""
+    print(f"[agent] {msg}", flush=True)
+
+
+# Plugins (Deepgram/Cartesia/OpenAI) read their keys from the environment. The
+# dedicated worker sets these, but the in-process path may import this module first;
+# export them here too so a TTS/STT plugin always finds its key regardless of entry
+# point. Only non-empty values are set so real Railway env vars are never clobbered.
+for _k, _v in {
+    "OPENAI_API_KEY": settings.OPENAI_API_KEY,
+    "DEEPGRAM_API_KEY": settings.DEEPGRAM_API_KEY,
+    "CARTESIA_API_KEY": settings.CARTESIA_API_KEY,
+}.items():
+    if _v and not os.environ.get(_k):
+        os.environ[_k] = _v
 
 # Unique-per-process agent identity. Every agent participant identity starts with
 # "clinic-agent" so the double-join guard can detect an agent that is already in a
@@ -84,32 +104,122 @@ async def _agent_already_in_room(room_name: str) -> bool:
 
 
 def _build_stt():
-    """Deepgram STT when a key + plugin are available, else OpenAI Whisper (multilingual)."""
+    """Streaming Deepgram STT (real-time, built for live calls) when a key + plugin are
+    available, else the fastest available OpenAI Whisper config. Deepgram is strongly
+    recommended — Whisper is batch (not streaming) and is the main STT latency source."""
     if settings.DEEPGRAM_API_KEY:
         try:
             from livekit.plugins import deepgram
-            return deepgram.STT(api_key=settings.DEEPGRAM_API_KEY)
+            _log(f"STT: Deepgram {settings.DEEPGRAM_STT_MODEL} (streaming, multi, endpointing=300ms)")
+            return deepgram.STT(
+                model=settings.DEEPGRAM_STT_MODEL or "nova-2-general",
+                language="multi",          # caller may speak en/ar/fr/es
+                interim_results=True,       # partials stream as the caller talks
+                punctuate=True,
+                smart_format=True,
+                endpointing_ms=300,         # fast end-of-speech detection
+                api_key=settings.DEEPGRAM_API_KEY,
+            )
         except Exception as e:
-            print(f"[agent] Deepgram unavailable ({type(e).__name__}: {e}); using OpenAI Whisper")
+            _log(f"Deepgram STT unavailable ({type(e).__name__}: {e}); falling back to Whisper")
     from livekit.plugins import openai
-    # detect_language=True so the caller can speak EN/AR/FR/ES.
+    # No Deepgram key/plugin -> fastest Whisper we can. NOTE: whisper-1 is BATCH, not
+    # streaming; Deepgram is strongly recommended to cut STT latency.
+    _log("STT: OpenAI Whisper-1 (BATCH fallback — set DEEPGRAM_API_KEY for streaming/low latency)")
     return openai.STT(model="whisper-1", detect_language=True, api_key=settings.OPENAI_API_KEY)
+
+
+def _build_tts(behavior_config: dict):
+    """Pick the fastest available streaming TTS.
+
+    Order honours TTS_PROVIDER: Deepgram aura (lowest latency, ENGLISH-ONLY) by default,
+    Cartesia sonic (fast AND multilingual — use for ar/fr/es callers), else OpenAI
+    gpt-4o-mini-tts (multilingual but slow). Each tier degrades gracefully to the next."""
+    provider = (settings.TTS_PROVIDER or "deepgram").lower()
+    voice = behavior_config.get("voice_id") or "shimmer"
+
+    if provider == "cartesia" and settings.CARTESIA_API_KEY:
+        try:
+            from livekit.plugins import cartesia
+            kwargs = {"model": settings.CARTESIA_TTS_MODEL or "sonic-2",
+                      "api_key": settings.CARTESIA_API_KEY}
+            if settings.CARTESIA_VOICE:
+                kwargs["voice"] = settings.CARTESIA_VOICE
+            _log(f"TTS: Cartesia {kwargs['model']} (streaming, multilingual)")
+            return cartesia.TTS(**kwargs)
+        except Exception as e:
+            _log(f"Cartesia TTS unavailable ({type(e).__name__}: {e}); trying Deepgram")
+
+    if provider in ("deepgram", "cartesia") and settings.DEEPGRAM_API_KEY:
+        try:
+            from livekit.plugins import deepgram
+            _log(f"TTS: Deepgram {settings.DEEPGRAM_TTS_MODEL} (streaming, ENGLISH-ONLY — "
+                 "non-English replies will be mispronounced; switch TTS_PROVIDER=cartesia for ar/fr/es)")
+            return deepgram.TTS(model=settings.DEEPGRAM_TTS_MODEL or "aura-asteria-en",
+                                api_key=settings.DEEPGRAM_API_KEY)
+        except Exception as e:
+            _log(f"Deepgram TTS unavailable ({type(e).__name__}: {e}); falling back to OpenAI")
+
+    from livekit.plugins import openai
+    _log("TTS: OpenAI gpt-4o-mini-tts (multilingual fallback — slower)")
+    return openai.TTS(model="gpt-4o-mini-tts", voice=voice, api_key=settings.OPENAI_API_KEY)
+
+
+def _build_turn_detection():
+    """Optional end-of-utterance (EOU) model for sharper, faster turn-taking than VAD
+    alone. Multilingual model matches the clinic's en/ar/fr/es. Degrades gracefully to
+    pure VAD endpointing when livekit-plugins-turn-detector / its model isn't installed."""
+    try:
+        from livekit.plugins.turn_detector.multilingual import MultilingualModel
+        _log("turn detection: MultilingualModel (EOU)")
+        return MultilingualModel()
+    except Exception as e:
+        _log(f"turn_detector unavailable ({type(e).__name__}: {e}); using VAD endpointing")
+        return None
 
 
 def _build_session(behavior_config: dict):
     from livekit.agents import AgentSession
     from livekit.plugins import openai, silero
 
-    voice = behavior_config.get("voice_id") or "shimmer"
-    return AgentSession(
-        # Silero VAD with a 0.6s stop window -> natural turn detection / endpointing.
-        vad=silero.VAD.load(min_silence_duration=0.6),
+    session_kwargs = dict(
+        # Tight VAD windows -> fast endpointing without clipping the caller.
+        vad=silero.VAD.load(min_silence_duration=0.3, min_speech_duration=0.1),
         stt=_build_stt(),
+        # AgentSession streams LLM tokens straight into the TTS as they generate.
         llm=openai.LLM(model="gpt-4o-mini", api_key=settings.OPENAI_API_KEY),
-        # gpt-4o-mini-tts is multilingual — same voice speaks the LLM's reply language.
-        tts=openai.TTS(model="gpt-4o-mini-tts", voice=voice, api_key=settings.OPENAI_API_KEY),
-        allow_interruptions=True,   # barge-in: caller speech stops TTS immediately
+        tts=_build_tts(behavior_config),
+        allow_interruptions=True,        # barge-in: caller speech stops TTS immediately
+        min_endpointing_delay=0.5,       # don't cut the caller off mid-thought
+        max_endpointing_delay=3.0,       # but never hang waiting forever
+        preemptive_generation=True,      # LLM starts before the caller fully stops
     )
+    td = _build_turn_detection()
+    if td is not None:
+        session_kwargs["turn_detection"] = td
+    return AgentSession(**session_kwargs)
+
+
+def _wire_session_logging(session) -> None:
+    """Log every pipeline step (Railway) so a stall is visible: STT result, LLM/assistant
+    message, agent speaking (TTS), and pipeline errors. Bound defensively so an unknown
+    event name on a future plugin version can never crash the agent."""
+    def _bind(name, fn):
+        try:
+            session.on(name, fn)
+        except Exception as e:
+            _log(f"could not bind event {name!r}: {e}")
+
+    _bind("agent_state_changed",
+          lambda ev: _log(f"agent_state -> {getattr(ev, 'new_state', ev)}"))  # 'speaking' = TTS playing
+    _bind("user_state_changed",
+          lambda ev: _log(f"user_state -> {getattr(ev, 'new_state', ev)}"))
+    _bind("user_input_transcribed",
+          lambda ev: _log(f"STT: {getattr(ev, 'transcript', '')!r} final={getattr(ev, 'is_final', '?')}"))
+    _bind("conversation_item_added",
+          lambda ev: _log(f"msg: role={getattr(getattr(ev, 'item', None), 'role', '?')} "
+                          f"text={getattr(getattr(ev, 'item', None), 'text_content', '')!r}"))
+    _bind("error", lambda ev: _log(f"session error: {getattr(ev, 'error', ev)}"))
 
 
 def _make_agent_class():
@@ -125,25 +235,42 @@ def _make_agent_class():
             self._on_end = on_end
 
         async def on_enter(self):
+            # Brief pause so the agent's audio track is fully published/subscribed
+            # before we speak — otherwise the first word(s) of the greeting get cut.
+            # session.say() with a fixed string is more reliable/instant than
+            # generate_reply() for a known greeting.
             try:
+                await asyncio.sleep(0.3)
+                _log("greeting: speaking")
                 await self.session.say(GREETING, allow_interruptions=True)
+                _log("greeting: done")
             except Exception as e:
-                print(f"[agent] greeting error: {type(e).__name__}: {e}")
+                _log(f"greeting error: {type(e).__name__}: {e}")
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
             """Guardrail: classify -> fetch real data -> inject a strict instruction
-            BEFORE the LLM responds. The LLM may only state what we provide here."""
+            BEFORE the LLM responds. The LLM may only state what we provide here.
+            Wrapped so an STT/classify/DB failure recovers (ask to repeat) instead of
+            leaving the caller in silence."""
             user_text = (new_message.text_content or "").strip()
+            _log(f"STT (final, user said): {user_text!r}")
             if not user_text:
                 return
-            last_assistant = self._last_assistant(turn_ctx)
-            decision = await self._brain.decide(user_text, last_assistant)
-            if self._on_state:
-                self._on_state(self._brain.snapshot())
-            # Strict per-turn instruction with ONLY the real DB data.
-            turn_ctx.add_message(role="system", content=decision["instruction"])
-            if decision.get("end") and self._on_end:
-                asyncio.create_task(self._on_end(decision["end"]))
+            try:
+                last_assistant = self._last_assistant(turn_ctx)
+                decision = await self._brain.decide(user_text, last_assistant)
+                if self._on_state:
+                    self._on_state(self._brain.snapshot())
+                # Strict per-turn instruction with ONLY the real DB data.
+                turn_ctx.add_message(role="system", content=decision["instruction"])
+                _log(f"guardrail: intent={decision.get('intent')} end={decision.get('end')}")
+                if decision.get("end") and self._on_end:
+                    asyncio.create_task(self._on_end(decision["end"]))
+            except Exception as e:
+                _log(f"turn handling error: {type(e).__name__}: {e}; asking caller to repeat")
+                turn_ctx.add_message(role="system", content=(
+                    "There was a brief technical issue understanding the caller. Apologise in one "
+                    "short sentence and ask them to please repeat what they said."))
 
         @staticmethod
         def _last_assistant(turn_ctx) -> str:
@@ -177,13 +304,14 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker):
         state.update(snap)
 
     session = _build_session(behavior_config or {})
+    _wire_session_logging(session)
     instructions = (behavior_config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
     agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end)
 
     room.on("disconnected", lambda *_a: done.set())
 
     await session.start(agent=agent, room=room, room_input_options=RoomInputOptions())
-    print(f"[agent] session started in room {getattr(room, 'name', '?')}")
+    _log(f"session started in room {getattr(room, 'name', '?')}")
 
     try:
         await asyncio.wait_for(done.wait(), timeout=max_duration)

@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     LIVEKIT_API_SECRET: str = ""
     DEEPGRAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
+    # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | openai.
+    # Deepgram aura is lowest-latency but ENGLISH-ONLY; use cartesia for multilingual.
+    TTS_PROVIDER: str = "deepgram"
+    DEEPGRAM_STT_MODEL: str = "nova-2-general"
+    DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
+    CARTESIA_TTS_MODEL: str = "sonic-2"
+    CARTESIA_VOICE: str = ""  # optional Cartesia voice id; blank = plugin default
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8030
     DEBUG: bool = True
