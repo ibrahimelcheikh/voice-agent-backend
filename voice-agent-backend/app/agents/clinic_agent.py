@@ -70,12 +70,14 @@ _WORKER_ID = uuid.uuid4().hex[:8]
 AGENT_IDENTITY = f"{AGENT_IDENTITY_PREFIX}-{_WORKER_ID}"
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a clinic receptionist AI. You may ONLY state information provided to you in "
-    "the function results. NEVER invent appointment times, prices, doctor names, or policies. "
-    "When a patient says a relative date like 'next Monday' or 'tomorrow', the actual calendar "
-    "date is computed for you — confirm it back to them and NEVER ask them to give you a "
-    "specific calendar date. If you don't have the data, offer to connect to staff. Keep "
-    "responses under 2 sentences. Be warm and professional."
+    "You are a clinic receptionist AI on a PHONE call. You may ONLY state information provided "
+    "to you in the function results. NEVER invent appointment times, prices, doctor names, or "
+    "policies. When a patient says a relative date like 'next Monday' or 'tomorrow', the actual "
+    "calendar date is computed for you — confirm it back and NEVER ask them for a specific "
+    "calendar date. Keep every response to ONE short sentence, maximum 15 words. Never list more "
+    "than 2 items; if listing services or insurance providers, say only the top 2-3 then ask if "
+    "they want more. Be brief and natural, like a real receptionist. If you don't have the data, "
+    "offer to connect to staff."
 )
 GREETING = (
     "Thank you for calling Prime Health Clinic. This is the AI assistant, how may I help you?"
@@ -128,14 +130,19 @@ def _build_stt():
     if settings.DEEPGRAM_API_KEY:
         try:
             from livekit.plugins import deepgram
-            _log(f"STT: Deepgram {settings.DEEPGRAM_STT_MODEL} (streaming, multi, endpointing=300ms)")
+            _log(f"STT: Deepgram {settings.DEEPGRAM_STT_MODEL} (streaming, multi, endpointing=500ms)")
+            # NOTE: the plugin sends Deepgram KeepAlive frames itself and treats a
+            # silence-timeout socket close as a *recoverable* STTError (it reconnects) —
+            # there is no `keepalive` kwarg to pass. endpointing_ms=500 waits a touch
+            # longer before declaring end-of-speech so the caller isn't cut off.
             return deepgram.STT(
                 model=settings.DEEPGRAM_STT_MODEL or "nova-2-general",
                 language="multi",          # caller may speak en/ar/fr/es
                 interim_results=True,       # partials stream as the caller talks
                 punctuate=True,
                 smart_format=True,
-                endpointing_ms=300,         # fast end-of-speech detection
+                no_delay=True,             # emit finals promptly, don't buffer
+                endpointing_ms=500,         # wait ~0.5s of silence before end-of-speech
                 api_key=settings.DEEPGRAM_API_KEY,
             )
         except Exception as e:
@@ -213,8 +220,8 @@ def _build_session(behavior_config: dict):
         llm=openai.LLM(model="gpt-4o-mini", api_key=settings.OPENAI_API_KEY, timeout=llm_timeout),
         tts=_build_tts(behavior_config),
         allow_interruptions=True,        # barge-in: caller speech stops TTS immediately
-        min_endpointing_delay=0.5,       # don't cut the caller off mid-thought
-        max_endpointing_delay=3.0,       # but never hang waiting forever
+        min_endpointing_delay=0.8,       # wait longer so the caller isn't cut off mid-sentence
+        max_endpointing_delay=4.0,       # but never hang waiting forever
         preemptive_generation=True,      # LLM starts before the caller fully stops
     )
     td = _build_turn_detection()
@@ -302,8 +309,15 @@ def _wire_session_logging(session) -> None:
     @session.on("error")
     def _on_error(ev):
         err = getattr(ev, "error", ev)
-        logger.error("❌ SESSION ERROR: %s", err)
-        # Best-effort audible recovery, debounced so we don't spam on a burst of errors.
+        recoverable = getattr(err, "recoverable", False)
+        logger.error("❌ SESSION ERROR (recoverable=%s): %s", recoverable, err)
+        # Recoverable errors (e.g. Deepgram closing the socket after silence — it
+        # reconnects) must NOT trigger a spoken prompt, or the agent says "could you
+        # repeat that?" unprompted when the caller simply went quiet.
+        if recoverable:
+            return
+        # Only on a genuine unrecoverable failure: best-effort audible recovery,
+        # debounced so we don't spam on a burst of errors.
         now = time.monotonic()
         if now - _spoke_fallback["t"] < 8:
             return

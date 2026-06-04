@@ -47,6 +47,28 @@ from livekit.agents import WorkerOptions, JobRequest, cli  # noqa: E402
 from app.agents.clinic_agent import entrypoint  # noqa: E402
 
 
+def _prewarm_models():
+    """Download the turn-detector (smart end-of-utterance) model into the local cache so
+    the MultilingualModel loads at call time instead of failing with 'languages.json not
+    found' and silently falling back to dumb VAD (which cuts callers off mid-sentence).
+
+    There is no Dockerfile here (Railway builds via Nixpacks), so we fetch at worker
+    startup rather than at image build. download_files() is the same routine the
+    `download-files` CLI runs; it no-ops when the files are already cached. Never fatal —
+    on failure the agent still runs with VAD endpointing."""
+    try:
+        from livekit.plugins import turn_detector  # noqa: F401 — registers the EOU plugin
+        from livekit.agents import Plugin
+        for p in Plugin.registered_plugins:
+            if "turn_detector" in (p.package or ""):
+                print(f"[worker] prewarming model: {p.package}")
+                p.download_files()
+        print("[worker] turn-detector model ready")
+    except Exception as e:
+        print(f"[worker] model prewarm failed ({type(e).__name__}: {e}); "
+              "agent will use VAD endpointing")
+
+
 async def _request_fnc(req: JobRequest):
     """Accept only SIP call rooms (prefixed `call-`); reject anything else."""
     room_name = (req.room.name if req.room else "") or ""
@@ -61,6 +83,7 @@ async def _request_fnc(req: JobRequest):
 def main():
     if len(sys.argv) == 1:
         sys.argv.append("start")
+    _prewarm_models()  # ensure the EOU model is cached before we start taking calls
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, request_fnc=_request_fnc))
 
 

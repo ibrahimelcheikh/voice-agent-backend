@@ -276,7 +276,10 @@ class GuardrailBrain:
             "offer to connect them to staff. When a date is already known, confirm it back to the "
             "caller (e.g. 'Monday, June 9') — NEVER ask the caller to provide a calendar date; "
             "relative dates like 'next Monday' are already resolved for you. "
-            f"Reply in {lang_name}, in 1-2 short, warm, professional sentences. Do not greet again."
+            "You are on a PHONE call: reply in ONE short sentence, MAXIMUM 15 words, like a real "
+            "receptionist. Never list more than 2 items — when listing services or insurers, give "
+            "only the top 2-3 then ask if they want more. "
+            f"Reply in {lang_name}. Do not greet again."
         )
         if last_assistant:
             guard += (f" Your previous reply was: \"{last_assistant}\". Do NOT repeat it; if the "
