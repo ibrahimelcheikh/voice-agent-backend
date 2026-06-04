@@ -128,12 +128,40 @@ _FUNCTION_ARGS = {
     "insurance_question": ["insurance_provider"],
 }
 
+# Intents that DO something and can sit "pending" awaiting confirmation / a missing
+# detail. A bare "yes" right after the agent asked to confirm one of these resolves
+# back to it (see GuardrailBrain._pending_intent).
+_ACTIONABLE = {"book_appointment", "cancel_appointment", "reschedule_appointment"}
+
+# Short affirmations that confirm a pending action. These must NEVER be treated as
+# "unclear" — a caller saying "yes" to "shall I book it?" is completing the booking.
+_AFFIRMATIVE_WORDS = {
+    "yes", "yeah", "yep", "yup", "yes please", "sure", "okay", "ok", "correct",
+    "right", "that's right", "thats right", "that is right", "that's correct",
+    "thats correct", "that is correct", "go ahead", "go for it", "please do",
+    "please", "do it", "confirm", "confirmed", "sounds good", "perfect",
+    "absolutely", "of course", "definitely", "exactly", "affirmative",
+}
+_AFFIRMATIVE_PREFIX = re.compile(
+    r"^(yes|yeah|yep|yup|sure|ok|okay|correct|right|confirm|confirmed)\b", re.I)
+
+
+def _is_affirmative(text: str) -> bool:
+    """True if the caller's utterance is a plain confirmation ('yes', 'that's right',
+    'go ahead', 'yes, that's correct') — i.e. agreement, not a new request."""
+    t = text.lower().strip().strip(".!?,")
+    if not t:
+        return False
+    if t in _AFFIRMATIVE_WORDS:
+        return True
+    return bool(_AFFIRMATIVE_PREFIX.match(t))
+
 
 class GuardrailBrain:
     """Framework-agnostic guardrail logic. One instance per call."""
 
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
-                 max_unclear: int = 3):
+                 max_unclear: int = 5):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
@@ -143,12 +171,19 @@ class GuardrailBrain:
             self._today_human = date.fromisoformat(today).strftime("%A, %B %d, %Y")
         except (ValueError, TypeError):
             self._today_human = today
+        # Lenient by default: only hand off to staff after many genuinely-unintelligible
+        # turns. The streak resets on ANY real intent / new entity / confirmation, so a
+        # caller who is actually being helped never hits this.
         self._max_unclear = max_unclear
 
         self.entities: dict = {}
         self.language = "en"
         self._language_locked = False
         self._unclear_streak = 0
+        # Last actionable intent awaiting confirmation / a missing detail. A follow-up
+        # "yes" or a bare detail (phone, time) resolves back to this instead of looking
+        # like an out-of-context, unclear utterance.
+        self._pending_intent: str | None = None
 
     def snapshot(self) -> dict:
         return {"language": self.language, "entities": dict(self.entities)}
@@ -161,7 +196,8 @@ class GuardrailBrain:
         """
         t0 = time.perf_counter()
         try:
-            intent, extracted, language = await self._classify(user_text)
+            intent, extracted, language = await self._classify(
+                user_text, last_assistant, self._pending_intent, self.entities)
         except Exception as e:
             logger.error("❌ classify error after %.0fms: %s: %s",
                          (time.perf_counter() - t0) * 1000, type(e).__name__, e)
@@ -171,16 +207,33 @@ class GuardrailBrain:
                 {"instruction_text": "There was a brief delay. Apologise in one short sentence "
                                      "and ask the caller to please repeat that."}),
                 "intent": "unclear", "data": {}, "end": None, "transfer": False}
-        logger.info("🧭 intent=%s lang=%s entities=%s in %.0fms",
-                    intent, language, extracted, (time.perf_counter() - t0) * 1000)
+
+        affirmative = _is_affirmative(user_text)
+        # Backstop for the classifier: a plain confirmation while an action is pending
+        # COMPLETES that action — it is never "unclear" or "end_call" noise. The
+        # accumulated entities are carried forward so the function fires with everything
+        # collected across the whole conversation.
+        if affirmative and self._pending_intent and intent in ("unclear", "end_call"):
+            logger.info("✅ affirmative %r resolved to pending intent %s",
+                        user_text, self._pending_intent)
+            intent = self._pending_intent
+
+        logger.info("🧭 intent=%s lang=%s entities=%s pending=%s in %.0fms",
+                    intent, language, extracted, self._pending_intent,
+                    (time.perf_counter() - t0) * 1000)
 
         if not self._language_locked and language in LANGUAGES:
             self.language = language
             self._language_locked = True
 
+        # Merge (never overwrite-and-forget) entities across turns. `contributed` tracks
+        # whether this turn added/changed any detail — a turn that moves the booking
+        # forward must reset the unclear streak even if the intent looked thin.
+        contributed = False
         for k in _ENTITY_KEYS:
-            if extracted.get(k):
+            if extracted.get(k) and self.entities.get(k) != extracted[k]:
                 self.entities[k] = extracted[k]
+                contributed = True
 
         # Deterministic relative-date resolution — so we never ask the caller for a
         # calendar date even if the classifier left it relative/blank.
@@ -189,6 +242,7 @@ class GuardrailBrain:
             field = "new_date" if intent == "reschedule_appointment" else "date"
             if not _is_iso_date(self.entities.get(field)):
                 self.entities[field] = resolved
+                contributed = True
                 logger.info("📅 resolved relative date -> %s (field=%s)", resolved, field)
 
         if intent == "end_call":
@@ -204,7 +258,13 @@ class GuardrailBrain:
                     "intent": intent, "data": {}, "end": None, "transfer": True}
 
         if intent == "unclear":
-            self._unclear_streak += 1
+            # An affirmation or any turn that contributed a detail is NEVER counted as
+            # unclear — the caller is engaged and moving forward, not stuck. Only a turn
+            # that is genuinely unintelligible advances the streak toward a handoff.
+            if affirmative or contributed:
+                self._unclear_streak = 0
+            else:
+                self._unclear_streak += 1
             if self._unclear_streak >= self._max_unclear:
                 return {"instruction": self._wrap(last_assistant,
                         {"action": "transfer",
@@ -215,7 +275,12 @@ class GuardrailBrain:
                      "task": "Ask one short, friendly clarifying question to find out how you can help."}),
                     "intent": intent, "data": {}, "end": None, "transfer": False}
 
+        # A real intent (or a turn that contributed an entity) means the call is making
+        # progress — reset the unclear streak so an earlier hiccup never triggers a handoff.
         self._unclear_streak = 0
+        # Remember an actionable intent so a follow-up "yes" / bare detail resolves to it.
+        if intent in _ACTIONABLE:
+            self._pending_intent = intent
 
         func = CLINIC_FUNCTIONS.get(intent)
         data = {}
@@ -232,6 +297,11 @@ class GuardrailBrain:
                              (time.perf_counter() - tf) * 1000, type(e).__name__, e)
                 data = {}
 
+        # Once an actionable request succeeds, clear the pending flag so a later "yes"
+        # can't accidentally repeat it (e.g. re-book the same appointment).
+        if intent in _ACTIONABLE and isinstance(data, dict) and data.get("success"):
+            self._pending_intent = None
+
         payload = {"intent": intent, "data": data}
         if intent == "book_appointment" and not data.get("success"):
             payload["task"] = ("The booking is not complete. Politely ask only for the missing "
@@ -239,7 +309,8 @@ class GuardrailBrain:
         return {"instruction": self._wrap(last_assistant, payload),
                 "intent": intent, "data": data, "end": None, "transfer": False}
 
-    async def _classify(self, user_text: str):
+    async def _classify(self, user_text: str, last_assistant: str = "",
+                        pending_intent: str | None = None, entities: dict | None = None):
         sys = (
             f"You route a medical-clinic phone call. Today is {self._today_human} "
             f"({self._today}). Classify the caller's latest message into exactly one intent "
@@ -249,10 +320,43 @@ class GuardrailBrain:
             "to give a calendar date. Detect the spoken language (en/ar/fr/es). "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
+
+        # Give the classifier short-term memory of the dialogue so short replies — "yes",
+        # "correct", a bare phone number or time — are interpreted against what the agent
+        # just asked and the action already in progress, instead of looking unclear.
+        ctx = []
+        if last_assistant:
+            ctx.append(f'The assistant just said: "{last_assistant}"')
+        if pending_intent:
+            ctx.append(f"An action is already in progress and awaiting completion: "
+                       f"{pending_intent}.")
+        if entities:
+            known = ", ".join(f"{k}={v}" for k, v in entities.items())
+            ctx.append(f"Details already collected this call: {known}.")
+        if ctx:
+            sys += (
+                "\n\nCONVERSATION CONTEXT (use it to interpret short replies):\n"
+                + "\n".join(ctx)
+                + "\n\nRULES FOR SHORT REPLIES:\n"
+                "- If the assistant just asked the caller to confirm an action and the "
+                "caller responds affirmatively (yes / yeah / correct / that's right / "
+                "go ahead / sure / please do), classify the intent as the pending action "
+                f"({pending_intent or 'the action in progress'}) — NOT 'unclear' — and "
+                "carry the already-collected entities forward.\n"
+                "- If the caller gives a bare detail (a phone number, a name, a time, a "
+                "doctor) that fills a missing field for the pending action, classify it as "
+                "that pending action and extract the new entity.\n"
+                "- Only use 'unclear' when the caller's message truly cannot be tied to "
+                "any intent or to the action in progress."
+            )
+
+        messages = [{"role": "system", "content": sys}]
+        if last_assistant:
+            messages.append({"role": "assistant", "content": last_assistant})
+        messages.append({"role": "user", "content": user_text})
         resp = await self._client.chat.completions.create(
             model=self._model,
-            messages=[{"role": "system", "content": sys},
-                      {"role": "user", "content": user_text}],
+            messages=messages,
             tools=_ROUTER_TOOL,
             tool_choice={"type": "function", "function": {"name": "route_intent"}},
             temperature=0,
