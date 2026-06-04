@@ -10,11 +10,12 @@ from datetime import datetime
 
 router = APIRouter()
 
-DEFAULT_WA_AGENT = "agt-003"
+DEFAULT_WA_AGENT = "agt-002"
 FALLBACK_SYSTEM_PROMPT = (
-    "You are Aria, the friendly WhatsApp assistant for the Golden Fork restaurant chain. "
-    "Help customers with reservations, orders, menu questions, hours, and locations. "
-    "Be concise, warm, and professional. Keep replies under 80 words."
+    "You are the WhatsApp assistant for Prime Health Clinic. Help patients with appointments, "
+    "clinic hours, services, doctors, and insurance questions. Only share information you are "
+    "sure of; if unsure, offer to connect them to staff. Be concise, warm, and professional. "
+    "Keep replies under 80 words."
 )
 
 

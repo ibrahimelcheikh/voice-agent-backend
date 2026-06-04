@@ -77,8 +77,8 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks,
             db.add(call)
             await db.commit()
 
-            from app.agents.pipecat_agent import run_agent_in_room
-            background_tasks.add_task(run_agent_in_room, room_name, behavior_config)
+            from app.agents.clinic_agent import run_agent_in_room
+            background_tasks.add_task(run_agent_in_room, room_name, behavior_config, call.id)
 
         elif event.event == "room_finished":
             room_name = event.room.name

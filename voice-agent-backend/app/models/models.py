@@ -56,7 +56,7 @@ class BehaviorConfig(Base):
     blocked_topics = Column(JSON, default=list)
     escalation_triggers = Column(JSON, default=list)
     data_extraction_fields = Column(JSON, default=list)
-    max_call_duration = Column(Integer, default=480)
+    max_call_duration = Column(Integer, default=300)
     versions = Column(JSON, default=list)  # version history snapshots
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -109,6 +109,7 @@ class Call(Base):
     direction = Column(SAEnum(CallDirection))
     caller_number = Column(String)
     called_number = Column(String, nullable=True)
+    language = Column(String, default="en")  # detected caller language (en/ar/fr/es)
     duration_seconds = Column(Integer, nullable=True)
     outcome = Column(SAEnum(CallOutcome), default=CallOutcome.in_progress)
     ai_score = Column(Float, nullable=True)
@@ -144,68 +145,93 @@ class WhatsAppMessage(Base):
     sent_at = Column(DateTime, server_default=func.now())
 
 
-# ── Golden Fork demo domain ──────────────────────────────────────────────
+# ── Prime Health Clinic domain ───────────────────────────────────────────
+# The voice agent is a medical-clinic receptionist. Every value the agent
+# speaks about appointments, doctors, services, hours, and insurance comes
+# from these tables — the LLM is forbidden from inventing any of it.
 
-class ReservationStatus(str, enum.Enum):
+class AppointmentStatus(str, enum.Enum):
+    booked = "booked"
     confirmed = "confirmed"
-    pending = "pending"
     cancelled = "cancelled"
     completed = "completed"
     no_show = "no_show"
 
 
-class OrderType(str, enum.Enum):
-    delivery = "delivery"
-    pickup = "pickup"
-    dine_in = "dine_in"
-
-
-class OrderStatus(str, enum.Enum):
-    received = "received"
-    preparing = "preparing"
-    ready = "ready"
-    delivered = "delivered"
-    cancelled = "cancelled"
-
-
-class Reservation(Base):
-    __tablename__ = "reservations"
+class Clinic(Base):
+    __tablename__ = "clinics"
     id = Column(String, primary_key=True, default=gen_uuid)
-    agent_id = Column(String, ForeignKey("agents.id"), nullable=True)
-    customer_name = Column(String, nullable=False)
-    customer_phone = Column(String, nullable=False)
-    party_size = Column(Integer, default=2)
-    date = Column(String, nullable=False)          # ISO date YYYY-MM-DD
-    time = Column(String, nullable=False)           # HH:MM
-    location = Column(String, default="Downtown")
-    status = Column(SAEnum(ReservationStatus), default=ReservationStatus.pending)
+    name = Column(String, nullable=False)
+    address = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+    hours = Column(JSON, default=dict)          # {"mon": "9:00 AM - 6:00 PM", ...}
+    timezone = Column(String, default="Asia/Beirut")
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class Doctor(Base):
+    __tablename__ = "doctors"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
+    name = Column(String, nullable=False)
+    specialty = Column(String, nullable=False)
+    available_days = Column(JSON, default=list)     # ["mon","tue",...]
+    available_hours = Column(JSON, default=dict)    # {"start": "09:00", "end": "17:00"}
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    clinic = relationship("Clinic", foreign_keys=[clinic_id])
+
+
+class Service(Base):
+    __tablename__ = "services"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
+    name = Column(String, nullable=False)
+    duration_minutes = Column(Integer, default=30)
+    price = Column(Integer, default=0)              # cents
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    clinic = relationship("Clinic", foreign_keys=[clinic_id])
+
+
+class Patient(Base):
+    __tablename__ = "patients"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
+    name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    email = Column(String, nullable=True)
+    date_of_birth = Column(String, nullable=True)   # YYYY-MM-DD
+    insurance_provider = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    clinic = relationship("Clinic", foreign_keys=[clinic_id])
+
+
+class Appointment(Base):
+    __tablename__ = "appointments"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
+    patient_id = Column(String, ForeignKey("patients.id"), nullable=True)
+    doctor_id = Column(String, ForeignKey("doctors.id"), nullable=True)
+    service_id = Column(String, ForeignKey("services.id"), nullable=True)
+    date = Column(String, nullable=False)           # YYYY-MM-DD
+    time = Column(String, nullable=False)           # HH:MM (24h)
+    status = Column(SAEnum(AppointmentStatus), default=AppointmentStatus.booked)
+    reason = Column(Text, nullable=True)
     created_via = Column(String, default="voice")   # voice / whatsapp / manual
     created_at = Column(DateTime, server_default=func.now())
+    patient = relationship("Patient", foreign_keys=[patient_id])
+    doctor = relationship("Doctor", foreign_keys=[doctor_id])
+    service = relationship("Service", foreign_keys=[service_id])
 
 
-class Order(Base):
-    __tablename__ = "orders"
+class InsuranceProvider(Base):
+    __tablename__ = "insurance_providers"
     id = Column(String, primary_key=True, default=gen_uuid)
-    agent_id = Column(String, ForeignKey("agents.id"), nullable=True)
-    customer_name = Column(String, nullable=False)
-    customer_phone = Column(String, nullable=False)
-    order_type = Column(SAEnum(OrderType), default=OrderType.pickup)
-    items = Column(JSON, default=list)              # [{name, qty, price}]
-    total = Column(Integer, default=0)              # cents
-    status = Column(SAEnum(OrderStatus), default=OrderStatus.received)
-    address = Column(String, nullable=True)
+    clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
+    name = Column(String, nullable=False)
+    accepted = Column(Boolean, default=True)
     notes = Column(Text, nullable=True)
-    created_via = Column(String, default="voice")
     created_at = Column(DateTime, server_default=func.now())
-
-
-class FAQ(Base):
-    __tablename__ = "faqs"
-    id = Column(String, primary_key=True, default=gen_uuid)
-    agent_id = Column(String, ForeignKey("agents.id"), nullable=True)
-    question = Column(String, nullable=False)
-    answer = Column(Text, nullable=False)
-    category = Column(String, default="general")
-    times_asked = Column(Integer, default=0)
-    created_at = Column(DateTime, server_default=func.now())
+    clinic = relationship("Clinic", foreign_keys=[clinic_id])

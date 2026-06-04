@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Secrets / local config
+.env
+.env.*
+
+# Generated prerecorded audio clips (regenerated on startup via OpenAI TTS)
+app/audio/*.mp3
+app/audio/*.pcm
+
+# Misc
+*.log
+.DS_Store

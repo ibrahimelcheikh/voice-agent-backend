@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
-    reservations, orders, faq, demo, livekit_webhooks,
+    appointments, patients, clinic_info, demo, livekit_webhooks,
 )
 from app.db.database import engine, Base
 from app.db.seed import seed_mock_data
@@ -19,24 +19,24 @@ from app.core.config import settings
 import app.models.models  # noqa: F401  (ensure all models are registered on Base)
 
 app = FastAPI(
-    title="Prime Tech AI — Voice Agent API",
+    title="Prime Tech AI — Clinic Voice Agent API",
     description="""
-    Atlas PrimeX Voice Agent Platform — "Aria" AI receptionist for the Golden Fork restaurant chain.
+    Prime Health Clinic AI receptionist — Twilio (SIP) → LiveKit → Pipecat pipeline.
 
     ## Features
-    - **Inbound / Outbound Calls**: Twilio + Pipecat + LiveKit voice agent with real action tools
-    - **Outbound Campaigns**: rate-limited AI calling campaigns
-    - **WhatsApp Agent**: contextual AI WhatsApp replies via Twilio
+    - **Inbound Calls**: Twilio + LiveKit + Pipecat voice agent (Silero VAD, barge-in)
+    - **Anti-Hallucination Guardrail**: intent → real DB function → strict LLM formatting
+    - **Multi-language**: English, Arabic, French, Spanish
     - **Behavior Lock Files**: versioned, exportable/importable agent behavior configs
     - **Call Analytics**: transcripts, scoring, sentiment timelines, AI analysis
-    - **Reservations / Orders / FAQ**: restaurant operations powered by the agent's tools
+    - **Appointments / Patients / Clinic Info**: the real data the agent speaks from
     - **Demo Simulator**: run full AI conversations without a phone (`POST /demo/simulate-call`)
 
     ## Demo Credentials
     - Email: admin@primetechai.com
     - Password: demo1234
     """,
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -61,6 +61,13 @@ async def startup():
     await seed_mock_data()
     await configure_twilio_webhook()
 
+    # Generate prerecorded greeting/goodbye/thinking clips (once) for fast call start.
+    try:
+        from app.agents.audio import ensure_audio_files
+        await ensure_audio_files()
+    except Exception as e:
+        print(f"⚠️ Could not prepare audio clips: {e}")
+
     # Fallback to the LiveKit webhook: poll for new SIP call rooms and join an
     # agent. Needs LiveKit creds; skip if running the dedicated agent_worker.
     if settings.ENABLE_ROOM_WATCHER and settings.LIVEKIT_API_KEY:
@@ -83,7 +90,7 @@ async def agent_room_watcher():
     per room, so this is safe alongside the webhook."""
     import asyncio
     from livekit import api as lkapi
-    from app.agents.pipecat_agent import run_agent_in_room
+    from app.agents.clinic_agent import run_agent_in_room
 
     handled_rooms: set[str] = set()
     lk = lkapi.LiveKitAPI(
@@ -138,9 +145,9 @@ app.include_router(campaigns.router, prefix="/campaigns", tags=["Campaigns"])
 app.include_router(whatsapp.router, prefix="/whatsapp", tags=["WhatsApp"])
 app.include_router(twilio_webhooks.router, prefix="/twilio", tags=["Twilio Webhooks"])
 app.include_router(livekit_webhooks.router, prefix="/livekit", tags=["LiveKit Webhooks"])
-app.include_router(reservations.router, prefix="/reservations", tags=["Reservations"])
-app.include_router(orders.router, prefix="/orders", tags=["Orders"])
-app.include_router(faq.router, prefix="/faq", tags=["FAQ"])
+app.include_router(appointments.router, prefix="/appointments", tags=["Appointments"])
+app.include_router(patients.router, prefix="/patients", tags=["Patients"])
+app.include_router(clinic_info.router, prefix="/clinic", tags=["Clinic Info"])
 app.include_router(demo.router, prefix="/demo", tags=["Demo"])
 
 

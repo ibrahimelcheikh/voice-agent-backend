@@ -18,7 +18,9 @@ livekit-api
 livekit-agents
 livekit-plugins-openai
 livekit-plugins-silero
-pipecat-ai
+livekit-plugins-deepgram
+pipecat-ai[silero,openai,deepgram,livekit]
+deepgram-sdk
 openai
 websockets
 aiohttp

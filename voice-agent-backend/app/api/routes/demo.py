@@ -20,43 +20,42 @@ import json
 router = APIRouter()
 
 ARIA_PROMPT = (
-    "You are Aria, the warm and efficient AI receptionist for the Golden Fork restaurant "
-    "chain (locations: Downtown, Midtown, Uptown, Airport). You book tables, take orders, "
-    "answer questions from the knowledge base, check reservations/orders, and transfer to a "
-    "human when a customer is upset or the request is out of scope. Always use your tools to "
-    "take real actions. Keep replies short and natural, like a phone call. When you have what "
-    "you need, confirm and close politely."
+    "You are the AI receptionist for Prime Health Clinic. You may ONLY state information "
+    "returned by your tools (clinic functions). NEVER invent appointment times, prices, doctor "
+    "names, or policies. Always use your tools to fetch real data, then phrase it naturally. "
+    "Collect the patient's name and phone before booking. Keep replies short and natural, like a "
+    "phone call. If a tool returns no data, offer to connect to staff. Confirm and close politely."
 )
 
 SCENARIOS = {
-    "reservation": [
-        "Hi, I'd like to book a table for 4 this Saturday at 7pm.",
-        "Downtown please. The name is John Smith, phone 415-555-0142.",
+    "book": [
+        "Hi, I'd like to book an appointment with the dentist this Friday at 10am.",
+        "My name is Omar Hassan, phone 415-555-0142.",
         "Great, thank you!",
     ],
-    "order": [
-        "Hi, I'd like to place a delivery order.",
-        "Two burgers and one caesar salad. Name is Maria Santos, phone 415-555-0188.",
-        "Deliver to 22 Oak Street. Thanks!",
+    "hours": [
+        "What are your opening hours?",
+        "Where are you located?",
+        "Thanks, that's all.",
     ],
-    "faq": [
-        "What are your hours?",
-        "Is parking available?",
-        "Do you have vegetarian options?",
+    "services": [
+        "What services do you offer and how much is a dental cleaning?",
+        "And do you accept Bupa insurance?",
+        "Perfect, thank you.",
     ],
-    "complaint": [
-        "My last delivery arrived completely cold and I'm really upset.",
-        "No, I don't want a coupon, I want to speak to a manager right now.",
+    "reschedule": [
+        "I need to move my appointment to next Tuesday at 3pm. My phone is 415-555-0188.",
+        "Yes please, thank you.",
     ],
-    "cancel": [
-        "I need to cancel my reservation. My phone is 415-555-0142.",
-        "Yes please cancel it. Thanks.",
+    "emergency": [
+        "I think I'm having chest pains right now.",
+        "Please connect me to someone.",
     ],
 }
 
 
 class SimulateCall(BaseModel):
-    scenario: str = "reservation"
+    scenario: str = "book"
 
 
 @router.post("/simulate-call")
@@ -156,26 +155,27 @@ async def _run_conversation(customer_turns, db):
                     continue
                 # Spoken reply
                 reply = msg.content or "..."
-                transcript.append(f"Aria: {reply}")
+                transcript.append(f"Assistant: {reply}")
                 messages.append({"role": "assistant", "content": reply})
                 break
         return transcript, escalated, tools_used
     except Exception as e:
         # Deterministic fallback so the demo always returns something useful.
         print(f"[demo] LLM simulation unavailable ({type(e).__name__}: {e}); using canned transcript")
-        return _canned(customer_turns), ("complaint" in str(customer_turns).lower()), tools_used
+        return _canned(customer_turns), ("emergency" in str(customer_turns).lower()
+                                         or "chest pain" in str(customer_turns).lower()), tools_used
 
 
 def _canned(customer_turns):
     lines = []
     replies = [
-        "Thank you for calling Golden Fork, this is Aria. How can I help you today?",
-        "Of course! Let me take care of that for you.",
+        "Thank you for calling Prime Health Clinic. This is the AI assistant, how may I help you?",
+        "Of course! Let me check that for you.",
         "All set — is there anything else I can help with?",
-        "Wonderful, have a great day!",
+        "Thank you for calling, have a great day!",
     ]
     for i, turn in enumerate(customer_turns):
-        lines.append(f"Aria: {replies[min(i, len(replies) - 1)]}")
+        lines.append(f"Assistant: {replies[min(i, len(replies) - 1)]}")
         lines.append(f"Customer: {turn}")
-    lines.append("Aria: Thank you, goodbye!")
+    lines.append("Assistant: Thank you, goodbye!")
     return lines
