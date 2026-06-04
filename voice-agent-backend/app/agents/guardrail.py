@@ -1,31 +1,22 @@
 """
-IntentGuardrailProcessor — the anti-hallucination wrapper.
+Anti-hallucination guardrail.
 
-This is the core safety mechanism. The LLM is NEVER allowed to freely generate
-clinic information. Instead, for every caller utterance this processor:
+Two layers live here:
 
-  1. Intercepts the transcribed user text (from the user context aggregator).
-  2. Classifies intent + entities with an OpenAI function call.
-  3. Executes the matching clinic_functions.* function -> REAL data from the DB.
-  4. Builds a STRICT, tightly-scoped instruction containing ONLY that data.
-  5. Hands that instruction to the LLM, which becomes a natural-language
-     formatter of real data — not a knowledge source.
+  * GuardrailBrain — pure, framework-agnostic logic. For every caller utterance it
+    classifies intent + entities + language (OpenAI function call), runs the matching
+    clinic_functions.* against the DB to get REAL data, and builds a STRICT, tightly
+    scoped instruction the LLM may use as its ONLY source of truth. The live phone
+    agent (clinic_agent.ClinicAgent.on_user_turn_completed) uses this directly — no
+    Pipecat needed, which is why it works inside the native livekit-agents AgentSession.
 
-It also handles: language detection (EN/AR/FR/ES), no-repetition, remembering
-entities already provided, clarifying questions on unclear intent, and signalling
-intelligent call ending.
+  * IntentGuardrailProcessor — a thin Pipecat FrameProcessor wrapper around the brain,
+    kept for the Pipecat pipeline variant and the spec's FILE 2 surface.
 
-Placed in the pipeline between the user context aggregator and the LLM:
-
-    ... -> user_aggregator -> IntentGuardrailProcessor -> LLM -> ...
+The LLM is forbidden from inventing appointment times, prices, doctor names, policies,
+or insurance details — it is only a natural-language formatter of the brain's data.
 """
 import json
-
-from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
-from pipecat.frames.frames import Frame, TextFrame, LLMMessagesFrame  # noqa: F401 (spec import surface)
-from pipecat.processors.aggregators.openai_llm_context import (
-    OpenAILLMContext, OpenAILLMContextFrame,
-)
 
 from app.agents.clinic_functions import CLINIC_FUNCTIONS
 
@@ -66,11 +57,9 @@ _ROUTER_TOOL = [{
     },
 }]
 
-# Entities that should persist across turns so we never re-ask for them.
 _ENTITY_KEYS = ["patient_name", "phone", "doctor", "date", "time", "new_date",
                 "new_time", "reason", "appointment_id", "insurance_provider"]
 
-# Which accumulated entities each clinic function call needs.
 _FUNCTION_ARGS = {
     "book_appointment": ["patient_name", "phone", "doctor", "date", "time", "reason"],
     "cancel_appointment": ["phone", "appointment_id"],
@@ -84,100 +73,74 @@ _FUNCTION_ARGS = {
 }
 
 
-class IntentGuardrailProcessor(FrameProcessor):
+class GuardrailBrain:
+    """Framework-agnostic guardrail logic. One instance per call."""
+
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
-                 max_unclear: int = 3, on_end_call=None, on_state=None, **kwargs):
-        super().__init__(**kwargs)
+                 max_unclear: int = 3):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
         self._today = today
         self._max_unclear = max_unclear
-        self._on_end_call = on_end_call        # async (reason) -> None
-        self._on_state = on_state              # (dict) -> None  (language/entities to call record)
 
         self.entities: dict = {}
         self.language = "en"
         self._language_locked = False
         self._unclear_streak = 0
-        self._ended = False
 
-    # ── frame plumbing ────────────────────────────────────────────────────────
+    def snapshot(self) -> dict:
+        return {"language": self.language, "entities": dict(self.entities)}
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
+    async def decide(self, user_text: str, last_assistant: str = "") -> dict:
+        """Classify -> fetch real data -> build a strict LLM instruction.
 
-        # Only intercept the user's aggregated context heading toward the LLM.
-        if isinstance(frame, OpenAILLMContextFrame) and direction == FrameDirection.DOWNSTREAM:
-            await self._handle_user_turn(frame)
-            return
-
-        await self.push_frame(frame, direction)
-
-    # ── the guardrail ─────────────────────────────────────────────────────────
-
-    async def _handle_user_turn(self, frame: OpenAILLMContextFrame):
-        if self._ended:
-            return
-        messages = frame.context.get_messages()
-        user_text = self._last_user_text(messages)
-        last_assistant = self._last_assistant_text(messages)
-
-        if not user_text:
-            # Nothing to classify — let the original context flow so the LLM can prompt.
-            await self.push_frame(frame, FrameDirection.DOWNSTREAM)
-            return
-
+        Returns {instruction, intent, data, end (reason|None), transfer (bool)}.
+        Never raises — on error it returns a safe "connect to staff" instruction.
+        """
         try:
             intent, extracted, language = await self._classify(user_text)
-        except Exception as e:  # never crash the call on a classifier hiccup
+        except Exception as e:
             print(f"[guardrail] classify error: {type(e).__name__}: {e}")
-            await self._emit_instruction(
-                "I'm having a little trouble — let me connect you with our staff who can help.",
-                user_text, last_assistant, force_text=True)
-            return
+            return {"instruction": self._wrap(
+                last_assistant,
+                {"instruction_text": "Apologise briefly and say you'll connect them with our staff who can help."}),
+                "intent": "unclear", "data": {}, "end": None, "transfer": True}
 
-        # Lock the caller's language on the first confident detection.
         if not self._language_locked and language in LANGUAGES:
             self.language = language
             self._language_locked = True
-            self._notify_state()
 
-        # Persist any new entities so we don't ask again.
         for k in _ENTITY_KEYS:
-            v = extracted.get(k)
-            if v:
-                self.entities[k] = v
+            if extracted.get(k):
+                self.entities[k] = extracted[k]
 
-        # End-call / human handoff intents short-circuit the LLM.
         if intent == "end_call":
-            await self._end("caller_said_goodbye")
-            return
-        if intent == "speak_to_human":
-            await self._emit_instruction(
-                None, user_text, last_assistant,
-                data={"action": "transfer", "message": "Connecting to a staff member."},
-                intent="speak_to_human")
-            return
+            return {"instruction": self._wrap(last_assistant,
+                    {"situation": "The caller is ending the call.",
+                     "task": "Give a brief, warm goodbye. Do not ask anything else."}),
+                    "intent": intent, "data": {}, "end": "caller_said_goodbye", "transfer": False}
 
-        # Unclear -> ask a clarifying question instead of guessing.
+        if intent == "speak_to_human":
+            return {"instruction": self._wrap(last_assistant,
+                    {"action": "transfer",
+                     "task": "Tell the caller you're connecting them to a staff member now."}),
+                    "intent": intent, "data": {}, "end": None, "transfer": True}
+
         if intent == "unclear":
             self._unclear_streak += 1
             if self._unclear_streak >= self._max_unclear:
-                await self._emit_instruction(
-                    None, user_text, last_assistant,
-                    data={"action": "transfer",
-                          "message": "I'm having trouble understanding. Let me connect you to our staff."},
-                    intent="speak_to_human", then_end="too_many_unclear")
-                return
-            await self._emit_instruction(
-                None, user_text, last_assistant,
-                data={"action": "clarify"}, intent="unclear")
-            return
+                return {"instruction": self._wrap(last_assistant,
+                        {"action": "transfer",
+                         "task": "Say you're having trouble understanding and will connect them to staff."}),
+                        "intent": intent, "data": {}, "end": "too_many_unclear", "transfer": True}
+            return {"instruction": self._wrap(last_assistant,
+                    {"situation": "The caller's request was unclear.",
+                     "task": "Ask one short, friendly clarifying question to find out how you can help."}),
+                    "intent": intent, "data": {}, "end": None, "transfer": False}
 
         self._unclear_streak = 0
 
-        # Execute the matching clinic function -> REAL data only.
         func = CLINIC_FUNCTIONS.get(intent)
         data = {}
         if func:
@@ -188,10 +151,12 @@ class IntentGuardrailProcessor(FrameProcessor):
                 print(f"[guardrail] function {intent} error: {type(e).__name__}: {e}")
                 data = {}
 
-        await self._emit_instruction(None, user_text, last_assistant,
-                                     data=data, intent=intent)
-
-    # ── classification ────────────────────────────────────────────────────────
+        payload = {"intent": intent, "data": data}
+        if intent == "book_appointment" and not data.get("success"):
+            payload["task"] = ("The booking is not complete. Politely ask only for the missing "
+                               "detail(s); do not confirm a booking.")
+        return {"instruction": self._wrap(last_assistant, payload),
+                "intent": intent, "data": data, "end": None, "transfer": False}
 
     async def _classify(self, user_text: str):
         sys = (
@@ -217,87 +182,83 @@ class IntentGuardrailProcessor(FrameProcessor):
         extracted = {k: args[k] for k in _ENTITY_KEYS if args.get(k)}
         return intent, extracted, language
 
-    # ── strict instruction -> LLM ─────────────────────────────────────────────
-
-    async def _emit_instruction(self, fixed_text, user_text, last_assistant, *,
-                                data=None, intent=None, force_text=False, then_end=None):
-        """Build a tight system instruction from REAL data and push a fresh,
-        minimal context to the LLM. The LLM may only phrase what's here."""
+    def _wrap(self, last_assistant: str, payload: dict) -> str:
+        """Build the strict per-turn system instruction around a data payload."""
         lang_name = LANGUAGES.get(self.language, "English")
         guard = (
-            "You are the AI receptionist for a medical clinic. You may ONLY use the "
-            "information provided below. NEVER invent appointment times, prices, doctor "
-            "names, policies, or insurance details. If the data is empty or a request "
-            "failed, apologise briefly and offer to connect them to staff. "
-            f"Reply in {lang_name}, in 1-2 short, warm, professional sentences. "
-            "Do not greet again."
+            "You are the AI receptionist for a medical clinic. You may ONLY use the information "
+            "provided below. NEVER invent appointment times, prices, doctor names, policies, or "
+            "insurance details. If the data is empty or a request failed, apologise briefly and "
+            "offer to connect them to staff. "
+            f"Reply in {lang_name}, in 1-2 short, warm, professional sentences. Do not greet again."
         )
         if last_assistant:
-            guard += (f" Your previous reply was: \"{last_assistant}\". Do NOT repeat it; "
-                      "if the information is unchanged, confirm it in different words.")
+            guard += (f" Your previous reply was: \"{last_assistant}\". Do NOT repeat it; if the "
+                      "information is unchanged, confirm it in different words.")
         if self.entities:
             known = ", ".join(f"{k}={v}" for k, v in self.entities.items())
             guard += f" Details already collected (never ask for these again): {known}."
+        return guard + "\n\nDATA (the only thing you may state):\n" + json.dumps(payload, ensure_ascii=False)
 
-        if force_text and fixed_text:
-            payload = {"instruction_text": fixed_text}
-        elif intent == "unclear":
-            payload = {"situation": "The caller's request was unclear.",
-                       "task": "Ask one short, friendly clarifying question to find out how you can help."}
-        elif data is not None:
-            payload = {"intent": intent, "data": data}
-            if intent == "book_appointment" and not data.get("success"):
-                payload["task"] = (
-                    "The booking is not complete. Politely ask only for the missing detail(s); "
-                    "do not confirm a booking.")
-        else:
-            payload = {"data": {}}
 
-        guard += "\n\nDATA (the only thing you may state):\n" + json.dumps(payload, ensure_ascii=False)
+# ── Pipecat wrapper (kept for the Pipecat pipeline variant / spec FILE 2) ─────
 
-        context = OpenAILLMContext(messages=[
-            {"role": "system", "content": guard},
-            {"role": "user", "content": user_text},
-        ])
-        await self.push_frame(OpenAILLMContextFrame(context=context), FrameDirection.DOWNSTREAM)
+class IntentGuardrailProcessor:
+    """Pipecat FrameProcessor that runs the GuardrailBrain. Imported lazily so that
+    the native livekit-agents path never needs Pipecat installed."""
 
-        if then_end:
-            await self._end(then_end)
+    def __new__(cls, *args, **kwargs):
+        from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
+        from pipecat.frames.frames import Frame  # noqa: F401
+        from pipecat.processors.aggregators.openai_llm_context import (
+            OpenAILLMContext, OpenAILLMContextFrame,
+        )
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+        class _Impl(FrameProcessor):
+            def __init__(self, *, openai_api_key, today, model="gpt-4o-mini",
+                         on_end_call=None, on_state=None, **kw):
+                super().__init__(**kw)
+                self._brain = GuardrailBrain(openai_api_key=openai_api_key, today=today, model=model)
+                self._on_end_call = on_end_call
+                self._on_state = on_state
+                self._ended = False
 
-    async def _end(self, reason: str):
-        if self._ended:
-            return
-        self._ended = True
-        self._notify_state()
-        if self._on_end_call:
-            try:
-                await self._on_end_call(reason)
-            except Exception as e:
-                print(f"[guardrail] on_end_call error: {type(e).__name__}: {e}")
+            async def process_frame(self, frame, direction):
+                await super().process_frame(frame, direction)
+                if isinstance(frame, OpenAILLMContextFrame) and direction == FrameDirection.DOWNSTREAM:
+                    await self._handle(frame)
+                    return
+                await self.push_frame(frame, direction)
 
-    def _notify_state(self):
-        if self._on_state:
-            try:
-                self._on_state({"language": self.language, "entities": dict(self.entities)})
-            except Exception:
-                pass
+            async def _handle(self, frame):
+                if self._ended:
+                    return
+                msgs = frame.context.get_messages()
+                user_text = _last(msgs, "user")
+                last_assistant = _last(msgs, "assistant")
+                if not user_text:
+                    await self.push_frame(frame, FrameDirection.DOWNSTREAM)
+                    return
+                decision = await self._brain.decide(user_text, last_assistant)
+                if self._on_state:
+                    self._on_state(self._brain.snapshot())
+                ctx = OpenAILLMContext(messages=[
+                    {"role": "system", "content": decision["instruction"]},
+                    {"role": "user", "content": user_text},
+                ])
+                await self.push_frame(OpenAILLMContextFrame(context=ctx), FrameDirection.DOWNSTREAM)
+                if decision.get("end") and self._on_end_call:
+                    self._ended = True
+                    await self._on_end_call(decision["end"])
 
-    @staticmethod
-    def _last_user_text(messages) -> str:
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, str):
-                    return c.strip()
-                if isinstance(c, list):  # multimodal — pull text parts
-                    return " ".join(p.get("text", "") for p in c if isinstance(p, dict)).strip()
-        return ""
+        def _last(messages, role):
+            for m in reversed(messages):
+                if m.get("role") == role:
+                    c = m.get("content")
+                    if isinstance(c, str):
+                        return c.strip()
+                    if isinstance(c, list):
+                        return " ".join(p.get("text", "") for p in c if isinstance(p, dict)).strip()
+            return ""
 
-    @staticmethod
-    def _last_assistant_text(messages) -> str:
-        for m in reversed(messages):
-            if m.get("role") == "assistant" and isinstance(m.get("content"), str):
-                return m["content"].strip()
-        return ""
+        return _Impl(*args, **kwargs)
