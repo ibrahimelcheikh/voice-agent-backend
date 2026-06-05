@@ -30,6 +30,20 @@ class CallOutcome(str, enum.Enum):
     abandoned = "abandoned"
     in_progress = "in_progress"
 
+
+class ReminderOutcome(str, enum.Enum):
+    """How an outbound appointment-reminder call turned out. Stored on the Appointment
+    so we never lose the result; 'no_answer'/'voicemail' are the cases the WhatsApp
+    fallback (next step) will pick up."""
+    calling = "calling"          # call placed, not yet resolved
+    answered = "answered"        # a human answered but took no confirm/reschedule/cancel action
+    confirmed = "confirmed"
+    rescheduled = "rescheduled"
+    cancelled = "cancelled"
+    no_answer = "no_answer"
+    voicemail = "voicemail"
+    failed = "failed"            # Twilio could not place/complete the call
+
 class CampaignStatus(str, enum.Enum):
     draft = "draft"
     active = "active"
@@ -104,6 +118,11 @@ class Call(Base):
     id = Column(String, primary_key=True, default=gen_uuid)
     agent_id = Column(String, ForeignKey("agents.id"), nullable=True)
     campaign_id = Column(String, ForeignKey("campaigns.id"), nullable=True)
+    # Set for outbound reminder calls so a placed call can be tied back to the
+    # appointment it is reminding about (used to resolve the agent's context when it
+    # joins the room, and to record the outcome).
+    appointment_id = Column(String, ForeignKey("appointments.id"), nullable=True)
+    purpose = Column(String, nullable=True)  # e.g. "reminder" for outbound reminder calls
     twilio_call_sid = Column(String, nullable=True, unique=True)
     livekit_room = Column(String, nullable=True)
     direction = Column(SAEnum(CallDirection))
@@ -220,6 +239,11 @@ class Appointment(Base):
     status = Column(SAEnum(AppointmentStatus), default=AppointmentStatus.booked)
     reason = Column(Text, nullable=True)
     created_via = Column(String, default="voice")   # voice / whatsapp / manual
+    # Outbound reminder tracking. `reminder_sent_at` is set the moment a reminder call
+    # is placed (it also guards against the scheduler calling the same appointment
+    # twice); `reminder_outcome` records the result (ReminderOutcome values).
+    reminder_sent_at = Column(DateTime, nullable=True)
+    reminder_outcome = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     patient = relationship("Patient", foreign_keys=[patient_id])
     doctor = relationship("Doctor", foreign_keys=[doctor_id])

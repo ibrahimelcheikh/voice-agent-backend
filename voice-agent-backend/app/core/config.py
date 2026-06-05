@@ -27,7 +27,19 @@ class Settings(BaseSettings):
     NGROK_URL: str = ""
     PUBLIC_URL: str = "https://voice-agent-backend-production-fa4e.up.railway.app"  # public base for Twilio webhooks + media stream
     RESET_DB: bool = False  # set true to drop+reseed a fresh demo DB on next boot
+    # IMPORTANT: keep FALSE. Reminders write state (reminder_sent_at / reminder_outcome)
+    # we must not lose, so the DB must persist across restarts. Only flip to true for a
+    # single deliberate one-shot wipe+reseed, then set it back to false.
     FORCE_SEED: bool = False  # set true to wipe + reseed once (e.g. on Railway); same effect as RESET_DB
+
+    # ── Outbound appointment reminders ──────────────────────────────────────
+    # How many hours before an appointment the reminder call goes out.
+    REMINDER_HOURS_BEFORE: int = 24
+    # Background sweep that auto-places due reminder calls.
+    REMINDER_SCHEDULER_ENABLED: bool = True
+    REMINDER_INTERVAL_MINUTES: int = 15   # how often the sweep runs
+    # Twilio Answering Machine Detection — lets us mark a call voicemail vs human.
+    REMINDER_MACHINE_DETECTION: bool = True
 
     @property
     def async_database_url(self) -> str:

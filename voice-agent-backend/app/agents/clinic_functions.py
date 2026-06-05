@@ -172,6 +172,36 @@ async def reschedule_appointment(phone=None, new_date=None, new_time=None,
                 "doctor": doc.name if doc else None}
 
 
+# ── 3b. Confirm ──────────────────────────────────────────────────────────────
+
+async def confirm_appointment(phone=None, appointment_id=None) -> dict:
+    """Mark an appointment confirmed. Used by the outbound reminder agent when the
+    patient says they'll keep the appointment. Targets a specific appointment_id when
+    known (reminder calls always pass it), else the patient's soonest open appointment."""
+    async with AsyncSessionLocal() as db:
+        q = select(Appointment).where(
+            Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
+        )
+        if appointment_id:
+            q = q.where(Appointment.id == appointment_id)
+        elif phone:
+            patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+            if not patient:
+                return {"success": False, "reason": "not_found"}
+            q = q.where(Appointment.patient_id == patient.id).order_by(Appointment.date)
+        else:
+            return {"success": False, "reason": "need_phone_or_id"}
+
+        appt = (await db.execute(q)).scalars().first()
+        if not appt:
+            return {"success": False, "reason": "not_found"}
+        appt.status = AppointmentStatus.confirmed
+        await db.commit()
+        doc = await db.get(Doctor, appt.doctor_id) if appt.doctor_id else None
+        return {"success": True, "appointment_id": appt.id, "date": appt.date,
+                "time": appt.time, "doctor": doc.name if doc else None}
+
+
 # ── 4. Check ─────────────────────────────────────────────────────────────────
 
 async def check_appointment(phone=None) -> dict:
@@ -283,6 +313,7 @@ CLINIC_FUNCTIONS = {
     "book_appointment": book_appointment,
     "cancel_appointment": cancel_appointment,
     "reschedule_appointment": reschedule_appointment,
+    "confirm_appointment": confirm_appointment,
     "check_appointment": check_appointment,
     "clinic_hours": get_clinic_hours,
     "clinic_location": get_clinic_location,

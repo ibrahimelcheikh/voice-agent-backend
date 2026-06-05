@@ -83,6 +83,40 @@ GREETING = (
     "Thank you for calling Prime Health Clinic. This is the AI assistant, how may I help you?"
 )
 
+# Outbound reminder calls open with this script instead of the inbound greeting. The
+# system prompt still forbids inventing any detail — only the real appointment data
+# (passed in via call_context) may be spoken.
+REMINDER_SYSTEM_PROMPT = (
+    "You are a clinic receptionist AI on an OUTBOUND reminder PHONE call: YOU called the "
+    "patient to remind them of an upcoming appointment. You may ONLY state the appointment "
+    "details provided to you in the function results — NEVER invent appointment times, "
+    "prices, doctor names, or policies. The patient may confirm, reschedule, or cancel; "
+    "handle whichever they choose. Keep every response to ONE short sentence, maximum 15 "
+    "words, warm and natural like a real receptionist. If they want something you don't "
+    "have data for, offer to connect them to staff."
+)
+
+
+def build_reminder_greeting(ctx: dict) -> str:
+    """First line the agent speaks on an outbound reminder call, built from the REAL
+    appointment data (no invented details)."""
+    doctor = ctx.get("doctor_name")
+    when_date = ctx.get("date_human") or ctx.get("date") or ""
+    when_time = ctx.get("time_human") or ctx.get("time") or ""
+    with_doctor = f" with {doctor}" if doctor else ""
+    when = ""
+    if when_date:
+        when = f" on {when_date}"
+        if when_time:
+            when += f" at {when_time}"
+    elif when_time:
+        when = f" at {when_time}"
+    return (
+        "Hello, this is the AI assistant from Prime Health Clinic calling to remind you of "
+        f"your appointment{with_doctor}{when}. "
+        "Would you like to confirm, reschedule, or cancel?"
+    )
+
 # Rooms handled in THIS process — guards the webhook and room watcher against a
 # double-join into the same room.
 _active_rooms: set[str] = set()
@@ -346,22 +380,30 @@ def _make_agent_class():
     from livekit.agents import Agent
 
     class ClinicAgent(Agent):
-        def __init__(self, *, instructions, on_state=None, on_end=None):
+        def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
+                     seed_entities=None, pending_intent=None):
             super().__init__(instructions=instructions)
+            # Outbound reminder calls seed the brain with the appointment context
+            # (appointment_id, phone) and a pending confirm intent so a bare "yes"
+            # confirms the right appointment and reschedule/cancel target it directly.
             self._brain = GuardrailBrain(openai_api_key=settings.OPENAI_API_KEY,
-                                         today=date.today().isoformat())
+                                         today=date.today().isoformat(),
+                                         seed_entities=seed_entities,
+                                         pending_intent=pending_intent)
             self._on_state = on_state
             self._on_end = on_end
+            self._greeting = greeting or GREETING
 
         async def on_enter(self):
             # Brief pause so the agent's audio track is fully published/subscribed
             # before we speak — otherwise the first word(s) of the greeting get cut.
             # session.say() with a fixed string is more reliable/instant than
-            # generate_reply() for a known greeting.
+            # generate_reply() for a known greeting. For outbound reminders this is the
+            # reminder script; for inbound it's the standard greeting.
             try:
                 await asyncio.sleep(0.3)
                 _log("greeting: speaking")
-                await self.session.say(GREETING, allow_interruptions=True)
+                await self.session.say(self._greeting, allow_interruptions=True)
                 _log("greeting: done")
             except Exception as e:
                 _log(f"greeting error: {type(e).__name__}: {e}")
@@ -405,10 +447,17 @@ def _make_agent_class():
     return ClinicAgent
 
 
-async def _serve(room, behavior_config, call_id, started_at, *, is_worker):
+async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
+                 call_context=None):
     """Build the session + guarded agent, start it on the (already-connected) room,
-    and run until the call ends (caller hangs up, agent ends it, or max duration)."""
+    and run until the call ends (caller hangs up, agent ends it, or max duration).
+
+    `call_context` is set for OUTBOUND reminder calls: it carries the appointment data
+    so the agent opens with the reminder script (not the inbound greeting) and the
+    guardrail targets the right appointment. None → a normal inbound call."""
     from livekit.agents import RoomInputOptions
+
+    reminder = bool(call_context and call_context.get("purpose") == "reminder")
 
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
     state = {"language": "en", "entities": {}}
@@ -428,8 +477,24 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker):
 
     session = _build_session(behavior_config or {})
     _wire_session_logging(session)
-    instructions = (behavior_config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-    agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end)
+
+    if reminder:
+        instructions = REMINDER_SYSTEM_PROMPT
+        greeting = build_reminder_greeting(call_context)
+        # Seed the appointment we're calling about so confirm/reschedule/cancel act on it.
+        seed_entities = {k: call_context[k] for k in ("appointment_id", "phone", "patient_name")
+                         if call_context.get(k)}
+        pending_intent = "confirm_appointment"
+        _log(f"outbound reminder call for appointment {call_context.get('appointment_id')}")
+    else:
+        instructions = (behavior_config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
+        greeting = GREETING
+        seed_entities = None
+        pending_intent = None
+
+    agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end,
+                                greeting=greeting, seed_entities=seed_entities,
+                                pending_intent=pending_intent)
 
     room.on("disconnected", lambda *_a: done.set())
 
@@ -452,6 +517,18 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker):
             pass
     await _close_call(call_id, state, end_reason["r"] or "completed", started_at)
 
+    # Record the reminder result on the appointment. A human answered (the agent ran),
+    # so the floor is "answered"; the guardrail upgrades it to confirmed/rescheduled/
+    # cancelled when the patient acts. no-answer/voicemail are set earlier by Twilio AMD.
+    if reminder:
+        try:
+            from app.services.reminder_service import finalize_reminder_outcome
+            outcome = state.get("reminder_outcome") or "answered"
+            await finalize_reminder_outcome(call_context.get("appointment_id"), call_id, outcome)
+            _log(f"reminder outcome recorded: {outcome}")
+        except Exception as e:
+            print(f"[agent] reminder finalize error: {type(e).__name__}: {e}")
+
 
 # ── Entry point 1: dedicated worker (livekit-agents dispatches a job) ─────────
 async def entrypoint(ctx):
@@ -470,8 +547,26 @@ async def entrypoint(ctx):
 
     print(f"[worker] connected to room {room_name} as {AGENT_IDENTITY}")
     agent_row, behavior_config = await _load_behavior()
-    call_id = await _create_call_record(agent_row, room_name, None)
-    await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True)
+
+    # Is this room one of our outbound reminder calls? If so we already have a Call
+    # record (created when the call was placed) and the appointment context; otherwise
+    # it's a normal inbound call and we create an inbound Call record.
+    call_context = None
+    try:
+        from app.services.reminder_service import resolve_outbound_context_for_room
+        call_context = await resolve_outbound_context_for_room(ctx.room)
+    except Exception as e:
+        print(f"[worker] outbound context resolve failed: {type(e).__name__}: {e}")
+
+    if call_context:
+        call_id = call_context.get("call_id")
+        print(f"[worker] room {room_name} is an outbound reminder for appointment "
+              f"{call_context.get('appointment_id')}")
+    else:
+        call_id = await _create_call_record(agent_row, room_name, None)
+
+    await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True,
+                 call_context=call_context)
 
 
 # ── Entry point 2: in-process (room watcher / LiveKit webhook) ────────────────
@@ -492,7 +587,17 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
         room = rtc.Room()
         await room.connect(settings.LIVEKIT_URL, generate_agent_token(room_name))
         print(f"[agent] connected to room {room_name} as {AGENT_IDENTITY}")
-        await _serve(room, behavior_config or {}, call_id, datetime.utcnow(), is_worker=False)
+        # Resolve outbound-reminder context (no-op for inbound calls).
+        call_context = None
+        try:
+            from app.services.reminder_service import resolve_outbound_context_for_room
+            call_context = await resolve_outbound_context_for_room(room)
+            if call_context:
+                call_id = call_context.get("call_id") or call_id
+        except Exception as e:
+            print(f"[agent] outbound context resolve failed: {type(e).__name__}: {e}")
+        await _serve(room, behavior_config or {}, call_id, datetime.utcnow(),
+                     is_worker=False, call_context=call_context)
     except Exception as e:
         print(f"[agent] error in room {room_name}: {type(e).__name__}: {e}")
     finally:

@@ -42,9 +42,31 @@ async def handle_inbound_call(request: Request, db: AsyncSession = Depends(get_d
     return Response(content=_sip_dial_twiml(), media_type="application/xml")
 
 
+def _hangup_twiml() -> str:
+    return '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n    <Hangup/>\n</Response>'
+
+
 @router.post("/outbound")
 async def handle_outbound_call(request: Request, db: AsyncSession = Depends(get_db)):
-    """Called by Twilio when our outbound call is answered — bridge into LiveKit SIP."""
+    """Called by Twilio when our outbound reminder call is answered.
+
+    With machine detection enabled, Twilio includes `AnsweredBy` here. If it answered to
+    a machine (voicemail), we record the outcome and hang up — no point running the agent
+    against an answering machine. A human answer is bridged into the LiveKit SIP trunk
+    (same path as inbound), where the agent worker joins and runs the reminder script."""
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    answered_by = form.get("AnsweredBy")  # human / machine_start / machine_end_beep / fax / unknown
+
+    if answered_by and (answered_by.startswith("machine") or answered_by == "fax"):
+        try:
+            from app.services.reminder_service import record_reminder_result_by_sid
+            await record_reminder_result_by_sid(call_sid, answered_by=answered_by)
+        except Exception as e:
+            print(f"[twilio] voicemail record error: {type(e).__name__}: {e}")
+        print(f"[twilio] outbound call {call_sid} answered by {answered_by} — hanging up")
+        return Response(content=_hangup_twiml(), media_type="application/xml")
+
     return Response(content=_sip_dial_twiml(), media_type="application/xml")
 
 @router.post("/status")
@@ -54,19 +76,35 @@ async def call_status_callback(request: Request, db: AsyncSession = Depends(get_
     call_sid = form_data.get("CallSid")
     call_status = form_data.get("CallStatus")
     duration = form_data.get("CallDuration", 0)
+    answered_by = form_data.get("AnsweredBy")  # present on AMD status callbacks
+
+    # For outbound reminder calls, map no-answer / busy / failed / voicemail onto the
+    # appointment's reminder_outcome (without overriding a human result the agent set).
+    try:
+        from app.services.reminder_service import record_reminder_result_by_sid
+        await record_reminder_result_by_sid(call_sid, twilio_status=call_status,
+                                            answered_by=answered_by)
+    except Exception as e:
+        print(f"[twilio] reminder status record error: {type(e).__name__}: {e}")
 
     result = await db.execute(select(Call).where(Call.twilio_call_sid == call_sid))
     call = result.scalars().first()
 
     if call:
-        call.duration_seconds = int(duration)
+        try:
+            call.duration_seconds = int(duration)
+        except (TypeError, ValueError):
+            pass
         call.ended_at = datetime.utcnow()
-        if call_status == "completed":
-            call.outcome = CallOutcome.resolved
-        elif call_status in ["no-answer", "busy"]:
-            call.outcome = CallOutcome.no_answer
-        elif call_status == "failed":
-            call.outcome = CallOutcome.abandoned
+        # Don't clobber a terminal outcome already recorded (e.g. voicemail/no_answer
+        # from AMD, or the agent's resolution) with a generic status mapping.
+        if call.outcome == CallOutcome.in_progress:
+            if call_status == "completed":
+                call.outcome = CallOutcome.resolved
+            elif call_status in ["no-answer", "busy"]:
+                call.outcome = CallOutcome.no_answer
+            elif call_status == "failed":
+                call.outcome = CallOutcome.abandoned
         await db.commit()
 
     return Response(content="OK", media_type="text/plain")

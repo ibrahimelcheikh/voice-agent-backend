@@ -80,9 +80,9 @@ def _resolve_relative_date(text: str, today_iso: str) -> str | None:
 
 INTENTS = [
     "book_appointment", "cancel_appointment", "reschedule_appointment",
-    "check_appointment", "clinic_hours", "clinic_location", "services_offered",
-    "doctor_availability", "insurance_question", "speak_to_human", "end_call",
-    "unclear",
+    "confirm_appointment", "check_appointment", "clinic_hours", "clinic_location",
+    "services_offered", "doctor_availability", "insurance_question",
+    "speak_to_human", "end_call", "unclear",
 ]
 
 # Single function the classifier is forced to call.
@@ -120,6 +120,7 @@ _FUNCTION_ARGS = {
     "book_appointment": ["patient_name", "phone", "doctor", "date", "time", "reason"],
     "cancel_appointment": ["phone", "appointment_id"],
     "reschedule_appointment": ["phone", "new_date", "new_time", "appointment_id"],
+    "confirm_appointment": ["phone", "appointment_id"],
     "check_appointment": ["phone"],
     "clinic_hours": [],
     "clinic_location": [],
@@ -131,7 +132,15 @@ _FUNCTION_ARGS = {
 # Intents that DO something and can sit "pending" awaiting confirmation / a missing
 # detail. A bare "yes" right after the agent asked to confirm one of these resolves
 # back to it (see GuardrailBrain._pending_intent).
-_ACTIONABLE = {"book_appointment", "cancel_appointment", "reschedule_appointment"}
+_ACTIONABLE = {"book_appointment", "cancel_appointment", "reschedule_appointment",
+               "confirm_appointment"}
+
+# Successful actionable intent -> the reminder outcome to record on the appointment.
+_INTENT_OUTCOME = {
+    "confirm_appointment": "confirmed",
+    "reschedule_appointment": "rescheduled",
+    "cancel_appointment": "cancelled",
+}
 
 # Short affirmations that confirm a pending action. These must NEVER be treated as
 # "unclear" — a caller saying "yes" to "shall I book it?" is completing the booking.
@@ -161,7 +170,8 @@ class GuardrailBrain:
     """Framework-agnostic guardrail logic. One instance per call."""
 
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
-                 max_unclear: int = 5):
+                 max_unclear: int = 5, seed_entities: dict | None = None,
+                 pending_intent: str | None = None):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
@@ -176,17 +186,26 @@ class GuardrailBrain:
         # caller who is actually being helped never hits this.
         self._max_unclear = max_unclear
 
-        self.entities: dict = {}
+        # Outbound reminder calls seed the entities (appointment_id, phone) and a pending
+        # intent (confirm_appointment) up front: the agent already knows which appointment
+        # this is, so confirm/reschedule/cancel target it directly and a bare "yes"
+        # confirms it without re-collecting any details.
+        self.entities: dict = dict(seed_entities or {})
         self.language = "en"
         self._language_locked = False
         self._unclear_streak = 0
         # Last actionable intent awaiting confirmation / a missing detail. A follow-up
         # "yes" or a bare detail (phone, time) resolves back to this instead of looking
         # like an out-of-context, unclear utterance.
-        self._pending_intent: str | None = None
+        self._pending_intent: str | None = pending_intent
+        # For outbound reminders: the result to record on the appointment. Defaults to
+        # "answered" (a human picked up) and upgrades to confirmed/rescheduled/cancelled
+        # as the patient acts.
+        self.reminder_outcome: str | None = None
 
     def snapshot(self) -> dict:
-        return {"language": self.language, "entities": dict(self.entities)}
+        return {"language": self.language, "entities": dict(self.entities),
+                "reminder_outcome": self.reminder_outcome}
 
     async def decide(self, user_text: str, last_assistant: str = "") -> dict:
         """Classify -> fetch real data -> build a strict LLM instruction.
@@ -298,9 +317,12 @@ class GuardrailBrain:
                 data = {}
 
         # Once an actionable request succeeds, clear the pending flag so a later "yes"
-        # can't accidentally repeat it (e.g. re-book the same appointment).
+        # can't accidentally repeat it (e.g. re-book the same appointment), and record
+        # the reminder outcome (confirmed / rescheduled / cancelled).
         if intent in _ACTIONABLE and isinstance(data, dict) and data.get("success"):
             self._pending_intent = None
+            if intent in _INTENT_OUTCOME:
+                self.reminder_outcome = _INTENT_OUTCOME[intent]
 
         payload = {"intent": intent, "data": data}
         if intent == "book_appointment" and not data.get("success"):

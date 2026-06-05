@@ -11,9 +11,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
-    appointments, patients, clinic_info, demo, livekit_webhooks,
+    appointments, patients, clinic_info, demo, livekit_webhooks, reminders,
 )
-from app.db.database import engine, Base, reset_schema
+from app.db.database import engine, Base, reset_schema, ensure_columns
 from app.db.seed import seed_mock_data
 from app.core.config import settings
 import app.models.models  # noqa: F401  (ensure all models are registered on Base)
@@ -63,10 +63,14 @@ async def startup():
     else:
         async with engine.begin() as conn:
             await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+        # create_all only adds missing TABLES, not missing COLUMNS — patch in the
+        # reminder columns on existing tables (no-op once present). See ensure_columns().
+        await ensure_columns()
     print("Checking if seed needed...")
     await seed_mock_data()
     print("Seed check complete")
     await configure_twilio_webhook()
+    start_reminder_scheduler()
 
     # Generate prerecorded greeting/goodbye/thinking clips (once) for fast call start.
     try:
@@ -85,6 +89,49 @@ async def startup():
     print("  Health: http://localhost:8030/health")
     print("  Demo login: admin@primetechai.com / demo1234")
     print("=" * 60)
+
+
+_scheduler = None
+
+
+def start_reminder_scheduler():
+    """Start the APScheduler job that auto-places appointment reminder calls.
+
+    Runs in THIS web-service process (it has the Twilio creds and places the calls); the
+    separate agent worker only joins the resulting LiveKit rooms. Disabled by setting
+    REMINDER_SCHEDULER_ENABLED=false. `coalesce=True` + `max_instances=1` mean a slow
+    sweep can never pile up overlapping runs."""
+    global _scheduler
+    if not settings.REMINDER_SCHEDULER_ENABLED:
+        print("⏰ Reminder scheduler disabled (REMINDER_SCHEDULER_ENABLED=false)")
+        return
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from app.services.reminder_service import run_reminder_sweep
+        _scheduler = AsyncIOScheduler(timezone="UTC")
+        _scheduler.add_job(
+            run_reminder_sweep,
+            "interval",
+            minutes=settings.REMINDER_INTERVAL_MINUTES,
+            id="reminder_sweep",
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        _scheduler.start()
+        print(f"⏰ Reminder scheduler started — every {settings.REMINDER_INTERVAL_MINUTES} min, "
+              f"calling {settings.REMINDER_HOURS_BEFORE}h before each appointment")
+    except Exception as e:
+        print(f"⚠️ Could not start reminder scheduler: {type(e).__name__}: {e}")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if _scheduler:
+        try:
+            _scheduler.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 async def configure_twilio_webhook():
@@ -120,6 +167,7 @@ app.include_router(appointments.router, prefix="/appointments", tags=["Appointme
 app.include_router(patients.router, prefix="/patients", tags=["Patients"])
 app.include_router(clinic_info.router, prefix="/clinic", tags=["Clinic Info"])
 app.include_router(demo.router, prefix="/demo", tags=["Demo"])
+app.include_router(reminders.router, prefix="/reminders", tags=["Reminders"])
 
 
 @app.get("/")

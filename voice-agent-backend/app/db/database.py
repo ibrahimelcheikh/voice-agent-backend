@@ -23,6 +23,28 @@ async def reset_schema():
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def ensure_columns():
+    """Additive, idempotent schema patch for columns introduced after the initial
+    deploy. `Base.metadata.create_all(checkfirst=True)` only creates MISSING TABLES —
+    it never adds new COLUMNS to a table that already exists. On a persistent DB (e.g.
+    Railway, where we deliberately keep data and no longer wipe/reseed), new model
+    columns would therefore be silently absent and every query referencing them would
+    fail. `ADD COLUMN IF NOT EXISTS` is safe to run on every boot: it adds the column
+    on the first deploy that needs it and no-ops thereafter. Never destroys data."""
+    statements = [
+        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMP",
+        "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_outcome VARCHAR",
+        "ALTER TABLE calls ADD COLUMN IF NOT EXISTS appointment_id VARCHAR",
+        "ALTER TABLE calls ADD COLUMN IF NOT EXISTS purpose VARCHAR",
+    ]
+    async with engine.begin() as conn:
+        for stmt in statements:
+            try:
+                await conn.execute(text(stmt))
+            except Exception as e:  # pragma: no cover - defensive; never block startup
+                print(f"[migrate] skipped {stmt!r}: {type(e).__name__}: {e}")
+
+
 async def get_db():
     async with AsyncSessionLocal() as session:
         try:
