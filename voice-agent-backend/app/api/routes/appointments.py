@@ -1,12 +1,13 @@
 """Appointments API — back-office view of the bookings the voice agent creates."""
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, or_
 from pydantic import BaseModel
 from typing import Optional
 
 from app.db.database import get_db
-from app.models.models import Appointment, Patient, Doctor, Service, AppointmentStatus
+from app.models.models import Appointment, Patient, Doctor, Service, Clinic, AppointmentStatus
 
 router = APIRouter()
 
@@ -17,6 +18,16 @@ class CreateAppointment(BaseModel):
     service_id: Optional[str] = None
     date: str
     time: str
+    reason: Optional[str] = None
+
+
+class QuickAppointment(BaseModel):
+    """Plain-values appointment for testing outbound reminders — no pre-existing IDs."""
+    patient_name: str
+    phone: str
+    doctor_name: str
+    date: str               # YYYY-MM-DD
+    time: str               # HH:MM (24h)
     reason: Optional[str] = None
 
 
@@ -68,6 +79,84 @@ async def create_appointment(data: CreateAppointment, db: AsyncSession = Depends
         raise HTTPException(404, "Patient not found")
     appt = Appointment(clinic_id=patient.clinic_id, created_via="manual",
                         **data.model_dump())
+    db.add(appt)
+    await db.commit()
+    return {"success": True, "data": await _serialize(db, appt)}
+
+
+@router.post("/quick")
+async def quick_create_appointment(data: QuickAppointment, db: AsyncSession = Depends(get_db)):
+    """Create an appointment from plain values (no pre-existing IDs) — a forgiving helper
+    for testing outbound reminders.
+
+    - Patient: looked up by phone; created with name+phone if not found.
+    - Doctor: fuzzy (ILIKE) match on the existing doctors by name (the 'Dr.' prefix is
+      optional). A clear error is returned if no doctor matches.
+    - Service: any service matching the doctor's specialty, else the first service.
+    """
+    clinic = (await db.execute(select(Clinic))).scalars().first()
+    clinic_id = clinic.id if clinic else None
+
+    # Patient — find by phone, create on miss.
+    patient = (await db.execute(
+        select(Patient).where(Patient.phone == data.phone)
+    )).scalars().first()
+    if not patient:
+        patient = Patient(clinic_id=clinic_id, name=data.patient_name, phone=data.phone)
+        db.add(patient)
+        await db.flush()
+
+    # Doctor — fuzzy match by name (drop a leading 'Dr.'/'Doctor' so 'Karim Nassar' hits
+    # 'Dr. Karim Nassar'). Match name OR specialty so 'dentist' also works.
+    needle = data.doctor_name.strip()
+    for stop in ("Dr.", "Dr ", "Doctor ", "dr.", "dr ", "doctor "):
+        if needle.lower().startswith(stop.lower()):
+            needle = needle[len(stop):].strip()
+            break
+    doctor = (await db.execute(
+        select(Doctor).where(
+            Doctor.is_active == True,  # noqa: E712
+            or_(Doctor.name.ilike(f"%{needle}%"), Doctor.specialty.ilike(f"%{needle}%")),
+        )
+    )).scalars().first()
+    if not doctor:
+        roster = (await db.execute(
+            select(Doctor).where(Doctor.is_active == True)  # noqa: E712
+        )).scalars().all()
+        raise HTTPException(422, {
+            "error": "doctor_not_found",
+            "message": f"No doctor matches '{data.doctor_name}'.",
+            "available_doctors": [{"name": d.name, "specialty": d.specialty} for d in roster],
+        })
+
+    # Service — prefer one whose name relates to the doctor's specialty (stem match, so
+    # 'Dentist' hits 'Dental Cleaning'), else the first available service. Best-effort; the
+    # reminder flow doesn't require a service.
+    services = (await db.execute(select(Service).order_by(Service.name))).scalars().all()
+
+    def _stems(text: str) -> set[str]:
+        # 4-char stems so 'dentist'/'dental' and 'cardiologist'/'cardiac' relate.
+        return {w[:4] for w in re.split(r"\W+", (text or "").lower()) if len(w) > 3}
+
+    specialty_stems = _stems(doctor.specialty)
+    service = None
+    for s in services:
+        if specialty_stems & _stems(s.name):
+            service = s
+            break
+    service = service or (services[0] if services else None)
+
+    appt = Appointment(
+        clinic_id=clinic_id,
+        patient_id=patient.id,
+        doctor_id=doctor.id,
+        service_id=service.id if service else None,
+        date=data.date,
+        time=data.time,
+        status=AppointmentStatus.booked,
+        reason=data.reason,
+        created_via="test",
+    )
     db.add(appt)
     await db.commit()
     return {"success": True, "data": await _serialize(db, appt)}
