@@ -166,6 +166,49 @@ def _is_affirmative(text: str) -> bool:
     return bool(_AFFIRMATIVE_PREFIX.match(t))
 
 
+# Closing / farewell phrases. When the caller signals they're finished, the call must END
+# — even right after a booking or confirmation, where the dialogue context would otherwise
+# tempt the classifier to (mis)tag a closer as confirm_appointment.
+_STRONG_CLOSERS = (
+    "that's it", "thats it", "that is it", "that's all", "thats all", "that is all",
+    "that'll be all", "thatll be all", "that will be all", "no thanks", "no thank you",
+    "no that's all", "no thats all", "nothing else", "i'm done", "im done", "i am done",
+    "we're done", "were done", "all done", "goodbye", "good bye", "bye bye",
+    "have a good day", "have a great day", "take care",
+)
+# A real farewell/thanks word — needed for the "pure sign-off" check below.
+_FAREWELL_CORE = {"thank", "thanks", "thankyou", "thx", "ty", "bye", "goodbye", "cheers",
+                  "done"}
+# Filler that may pad a sign-off ("okay, thank you so much!") without changing that it's
+# a closer. Deliberately excludes words like "correct"/"right" that mark an acknowledgement.
+_CLOSING_FILLER = {"ok", "okay", "alright", "alrighty", "great", "perfect", "cool",
+                   "awesome", "good", "you", "so", "much", "very", "really", "appreciate",
+                   "it", "yes", "yeah", "yep", "no", "nope", "and", "that's", "thats",
+                   "all", "now", "a", "lot"}
+
+
+def _is_closing(text: str) -> bool:
+    """True if the caller is signing off (that's it / that's all / no thanks / thank you /
+    goodbye / I'm done). Deterministic so a closer is never mis-tagged as confirm_appointment
+    in a post-booking context. NOTE: 'yes that's correct' is NOT closing — it's an
+    acknowledgement (handled separately)."""
+    t = text.lower().strip()
+    t = re.sub(r"[^\w\s']", " ", t)      # strip punctuation
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t:
+        return False
+    for phrase in _STRONG_CLOSERS:
+        if phrase in t:
+            return True
+    # Pure sign-off: every word is filler/thanks/farewell AND at least one is a real
+    # farewell word ("thank you", "thanks!", "okay bye"). 'ok great' has no farewell word,
+    # so it is treated as a plain acknowledgement, not an end-of-call.
+    tokens = t.split()
+    has_farewell = any(tok in _FAREWELL_CORE for tok in tokens)
+    only_filler = all(tok in _FAREWELL_CORE or tok in _CLOSING_FILLER for tok in tokens)
+    return has_farewell and only_filler
+
+
 class GuardrailBrain:
     """Framework-agnostic guardrail logic. One instance per call."""
 
@@ -198,6 +241,12 @@ class GuardrailBrain:
         # "yes" or a bare detail (phone, time) resolves back to this instead of looking
         # like an out-of-context, unclear utterance.
         self._pending_intent: str | None = pending_intent
+        # True once an appointment has been booked/confirmed (or rescheduled/cancelled)
+        # this call. Guards against the re-confirmation loop: a follow-up affirmation after
+        # a settled booking is a simple acknowledgement, NOT a request to re-run
+        # confirm_appointment and re-read the details. Reminder calls start False (the
+        # appointment is still unconfirmed and the caller is about to confirm it once).
+        self._settled = False
         # For outbound reminders: the result to record on the appointment. Defaults to
         # "answered" (a human picked up) and upgrades to confirmed/rescheduled/cancelled
         # as the patient acts.
@@ -216,7 +265,8 @@ class GuardrailBrain:
         t0 = time.perf_counter()
         try:
             intent, extracted, language = await self._classify(
-                user_text, last_assistant, self._pending_intent, self.entities)
+                user_text, last_assistant, self._pending_intent, self.entities,
+                settled=self._settled)
         except Exception as e:
             logger.error("❌ classify error after %.0fms: %s: %s",
                          (time.perf_counter() - t0) * 1000, type(e).__name__, e)
@@ -228,17 +278,36 @@ class GuardrailBrain:
                 "intent": "unclear", "data": {}, "end": None, "transfer": False}
 
         affirmative = _is_affirmative(user_text)
+        closing = _is_closing(user_text)
+        # Fix 2 — closing/farewell phrases ALWAYS end the call, with priority over any
+        # pending action. Right after a booking the dialogue context otherwise tempts the
+        # classifier to tag "okay that's it, thank you" as confirm_appointment; this stops
+        # that and lets the agent give the goodbye and hang up.
+        if closing:
+            if intent != "end_call":
+                logger.info("👋 closing phrase %r -> end_call (was %s)", user_text, intent)
+            intent = "end_call"
+        # Fix 1 & 3 — never re-confirm/re-read an appointment that's already settled this
+        # call. Once we've booked and read the appointment back, a follow-up affirmation
+        # ("yes", "that's correct", "great") is a simple acknowledgement, not a request to
+        # run confirm_appointment again. (Reminder calls start unsettled, so the caller's
+        # first confirmation of an existing booking still runs once.)
+        elif self._settled and (intent == "confirm_appointment"
+                                or (affirmative and intent in ("unclear", "end_call"))):
+            logger.info("👍 acknowledgement of already-settled appointment %r (was %s)",
+                        user_text, intent)
+            intent = "_acknowledge"
         # Backstop for the classifier: a plain confirmation while an action is pending
         # COMPLETES that action — it is never "unclear" or "end_call" noise. The
         # accumulated entities are carried forward so the function fires with everything
         # collected across the whole conversation.
-        if affirmative and self._pending_intent and intent in ("unclear", "end_call"):
+        elif affirmative and self._pending_intent and intent in ("unclear", "end_call"):
             logger.info("✅ affirmative %r resolved to pending intent %s",
                         user_text, self._pending_intent)
             intent = self._pending_intent
 
-        logger.info("🧭 intent=%s lang=%s entities=%s pending=%s in %.0fms",
-                    intent, language, extracted, self._pending_intent,
+        logger.info("🧭 intent=%s lang=%s entities=%s pending=%s settled=%s in %.0fms",
+                    intent, language, extracted, self._pending_intent, self._settled,
                     (time.perf_counter() - t0) * 1000)
 
         if not self._language_locked and language in LANGUAGES:
@@ -263,6 +332,18 @@ class GuardrailBrain:
                 self.entities[field] = resolved
                 contributed = True
                 logger.info("📅 resolved relative date -> %s (field=%s)", resolved, field)
+
+        if intent == "_acknowledge":
+            # Already-settled appointment + a bare acknowledgement: respond briefly and
+            # DO NOT call any function or re-read the appointment (Fix 1 & 3).
+            self._unclear_streak = 0
+            return {"instruction": self._wrap(last_assistant,
+                    {"situation": "The appointment is already booked and confirmed; the caller "
+                                  "is simply acknowledging — not asking for anything new.",
+                     "task": "Give a brief acknowledgement such as \"You're all set — anything "
+                             "else?\". Do NOT repeat or re-read the appointment details, and do "
+                             "not state any new information."}),
+                    "intent": "acknowledge", "data": {}, "end": None, "transfer": False}
 
         if intent == "end_call":
             return {"instruction": self._wrap(last_assistant,
@@ -321,6 +402,9 @@ class GuardrailBrain:
         # the reminder outcome (confirmed / rescheduled / cancelled).
         if intent in _ACTIONABLE and isinstance(data, dict) and data.get("success"):
             self._pending_intent = None
+            # Mark the appointment settled so a follow-up affirmation acknowledges rather
+            # than re-running confirm + re-reading the appointment (the re-confirmation loop).
+            self._settled = True
             if intent in _INTENT_OUTCOME:
                 self.reminder_outcome = _INTENT_OUTCOME[intent]
 
@@ -332,7 +416,8 @@ class GuardrailBrain:
                 "intent": intent, "data": data, "end": None, "transfer": False}
 
     async def _classify(self, user_text: str, last_assistant: str = "",
-                        pending_intent: str | None = None, entities: dict | None = None):
+                        pending_intent: str | None = None, entities: dict | None = None,
+                        settled: bool = False):
         sys = (
             f"You route a medical-clinic phone call. Today is {self._today_human} "
             f"({self._today}). Classify the caller's latest message into exactly one intent "
@@ -340,6 +425,9 @@ class GuardrailBrain:
             "'tomorrow', 'this Friday', 'next Monday at 3pm', 'next week' — into absolute "
             "YYYY-MM-DD and 24h HH:MM. NEVER leave a date relative and never expect the caller "
             "to give a calendar date. Detect the spoken language (en/ar/fr/es). "
+            "If the caller signals they are finished — 'that's it', 'that's all', 'no thanks', "
+            "'thank you', 'goodbye', 'I'm done' — classify as 'end_call', even right after a "
+            "booking or confirmation; a sign-off is NEVER 'confirm_appointment'. "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
 
@@ -349,6 +437,9 @@ class GuardrailBrain:
         ctx = []
         if last_assistant:
             ctx.append(f'The assistant just said: "{last_assistant}"')
+        if settled:
+            ctx.append("The appointment has ALREADY been booked and confirmed this call "
+                       "(the assistant has already read it back once).")
         if pending_intent:
             ctx.append(f"An action is already in progress and awaiting completion: "
                        f"{pending_intent}.")
@@ -360,12 +451,21 @@ class GuardrailBrain:
                 "\n\nCONVERSATION CONTEXT (use it to interpret short replies):\n"
                 + "\n".join(ctx)
                 + "\n\nRULES FOR SHORT REPLIES:\n"
-                "- If the assistant just asked the caller to confirm an action and the "
-                "caller responds affirmatively (yes / yeah / correct / that's right / "
-                "go ahead / sure / please do), classify the intent as the pending action "
-                f"({pending_intent or 'the action in progress'}) — NOT 'unclear' — and "
-                "carry the already-collected entities forward.\n"
-                "- If the caller gives a bare detail (a phone number, a name, a time, a "
+                "- If the caller signals they are finished (that's it / that's all / no "
+                "thanks / thank you / goodbye / I'm done), classify as 'end_call' — even "
+                "right after a booking. A sign-off is never 'confirm_appointment'.\n"
+                + ("- The appointment is ALREADY confirmed. A bare acknowledgement (yes / "
+                   "that's correct / great / okay / perfect) is NOT a request to confirm "
+                   "again — classify it as 'unclear' (a simple acknowledgement) unless the "
+                   "caller clearly asks for something new. Use 'check_appointment' only if "
+                   "they explicitly ask what/when their appointment is or to repeat it.\n"
+                   if settled else
+                   "- If the assistant just asked the caller to confirm an action and the "
+                   "caller responds affirmatively (yes / yeah / correct / that's right / "
+                   "go ahead / sure / please do), classify the intent as the pending action "
+                   f"({pending_intent or 'the action in progress'}) — NOT 'unclear' — and "
+                   "carry the already-collected entities forward.\n")
+                + "- If the caller gives a bare detail (a phone number, a name, a time, a "
                 "doctor) that fills a missing field for the pending action, classify it as "
                 "that pending action and extract the new entity.\n"
                 "- Only use 'unclear' when the caller's message truly cannot be tied to "
