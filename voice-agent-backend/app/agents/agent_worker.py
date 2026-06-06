@@ -70,13 +70,20 @@ def _prewarm_models():
 
 
 async def _request_fnc(req: JobRequest):
-    """Accept only SIP call rooms (prefixed `call-`); reject anything else."""
+    """Auto-accept inbound SIP call rooms (prefixed `call-`); reject anything else.
+
+    This is the same auto-accept behavior the worker had before the multi-tenant refactor —
+    it does NOT look at tenant/metadata; the tenant is resolved later, at agent start, from
+    the dialed number. The log line below fires for EVERY job request the worker is offered,
+    so if an inbound call produces no '◀ JOB REQUEST' line, no room was created for it
+    (the SIP trunk rejected the call) — the problem is upstream, not here."""
     room_name = (req.room.name if req.room else "") or ""
+    print(f"[worker] ◀ JOB REQUEST received for room {room_name!r}", flush=True)
     if room_name.startswith("call-"):
-        print(f"[worker] accepting job for room {room_name}")
+        print(f"[worker] ✅ accepting job for room {room_name}", flush=True)
         await req.accept()
     else:
-        print(f"[worker] rejecting non-call room {room_name!r}")
+        print(f"[worker] rejecting non-call room {room_name!r}", flush=True)
         await req.reject()
 
 

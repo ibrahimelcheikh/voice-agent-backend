@@ -564,8 +564,22 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
 # ── Entry point 1: dedicated worker (livekit-agents dispatches a job) ─────────
 async def entrypoint(ctx):
     from livekit.agents import AutoSubscribe
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    # Log the moment a job lands — BEFORE connecting — so the worker log shows every
+    # accepted inbound SIP job even if connecting/resolution later hiccups. If you see no
+    # "JOB RECEIVED" line on an inbound call, the problem is upstream of the agent (the SIP
+    # trunk rejected the call / no room was created), not in this entrypoint.
+    pre_room = getattr(getattr(ctx, "room", None), "name", None) or "?"
+    print(f"[agent] ▶ JOB RECEIVED for room {pre_room}", flush=True)
+
+    try:
+        await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    except Exception as e:
+        print(f"[agent] ❌ connect failed for room {pre_room}: {type(e).__name__}: {e}",
+              flush=True)
+        raise
     room_name = ctx.room.name
+    print(f"[agent] connected to room {room_name} as {AGENT_IDENTITY}", flush=True)
 
     # Double-join guard: if another agent participant is already in this room, bail
     # out so only one agent ever answers a call.
@@ -576,11 +590,11 @@ async def entrypoint(ctx):
         await ctx.room.disconnect()
         return
 
-    print(f"[worker] connected to room {room_name} as {AGENT_IDENTITY}")
-
-    # PHONE -> TENANT ROUTING: resolve the tenant from the dialed number on the SIP join
-    # and load that tenant's config (greeting, system prompt, voice). Falls back to the
-    # default tenant when the number can't be read (best-effort SIP attributes).
+    # PHONE -> TENANT ROUTING: resolve the tenant from the DIALED number on the SIP join
+    # and load that tenant's config (greeting, system prompt, voice). This happens here, at
+    # call time, looked up from the DB — it is NOT required as pre-set job metadata, so a
+    # plain inbound SIP call resolves its tenant fine. Never throws: on any failure it
+    # returns the default tenant (or empty config) so the agent STILL answers the call.
     tenant_id, behavior_config = await _resolve_tenant(ctx.room)
 
     # Is this room one of our outbound reminder calls? If so we already have a Call
@@ -655,17 +669,27 @@ async def _resolve_tenant(room):
     raises — returns (None, {}) on failure."""
     try:
         from app.db.database import AsyncSessionLocal
-        from app.services.tenant_service import tenant_context_for_room
+        from app.services.tenant_service import tenant_context_for_room, sip_called_number
+        dialed = None
+        try:
+            dialed = sip_called_number(room)
+        except Exception:
+            dialed = None
         async with AsyncSessionLocal() as db:
             resolved = await tenant_context_for_room(db, room)
         if resolved:
             tenant_id, config = resolved
-            _log(f"tenant resolved: {config.get('business_name')} ({tenant_id})")
+            print(f"[agent] resolved tenant: {config.get('business_name')} "
+                  f"({config.get('niche')}) for dialed number {dialed or 'unknown'} "
+                  f"[tenant_id={tenant_id}]", flush=True)
             return tenant_id, config
-        _log("no tenant resolved for room; running with defaults")
+        print(f"[agent] no tenant resolved for dialed number {dialed or 'unknown'}; "
+              "running with defaults", flush=True)
         return None, {}
     except Exception as e:
-        print(f"[agent] tenant resolve failed: {type(e).__name__}: {e}")
+        # Tenant resolution must NEVER stop the agent from answering — fall back to defaults.
+        print(f"[agent] tenant resolve failed: {type(e).__name__}: {e}; running with defaults",
+              flush=True)
         return None, {}
 
 
