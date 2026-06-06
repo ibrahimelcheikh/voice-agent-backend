@@ -55,6 +55,10 @@ class KnowledgeBase(BaseModel):
     knowledge_base: dict[str, Any]
 
 
+class SetPhone(BaseModel):
+    twilio_phone_number: str
+
+
 def _serialize(t: Tenant) -> dict:
     return {
         "id": t.id,
@@ -198,6 +202,47 @@ async def update_tenant(tenant_id: str, data: UpdateTenant, request: Request,
          f"business_name={t.business_name!r} niche={t.niche.value if t.niche else None} "
          f"is_active={t.is_active}")
     return {"success": True, "updated_fields": sorted(updates.keys()),
+            "data": _serialize(t)}
+
+
+@router.post("/{tenant_id}/set-phone")
+async def set_phone(tenant_id: str, data: SetPhone, db: AsyncSession = Depends(get_db)):
+    """Dead-simple, conflict-proof Twilio-number assignment.
+
+    Sets `twilio_phone_number` on the given tenant. If ANY other tenant currently owns that
+    number, theirs is cleared to NULL first (in the SAME transaction) so the UNIQUE
+    constraint can't block the reassignment. Commits and returns the updated tenant."""
+    number = (data.twilio_phone_number or "").strip()
+    if not number:
+        raise HTTPException(422, "twilio_phone_number is required")
+
+    t = await db.get(Tenant, tenant_id)
+    if not t:
+        raise HTTPException(404, "Tenant not found")
+
+    _log(f"set-phone /{tenant_id}: current={t.twilio_phone_number!r} -> requested={number!r}")
+
+    # Free the number from any OTHER tenant that holds it, then flush so the UPDATE that
+    # nulls them lands before we assign the number here (avoids a unique-constraint clash
+    # inside the one transaction).
+    others = (await db.execute(
+        select(Tenant).where(Tenant.twilio_phone_number == number, Tenant.id != tenant_id)
+    )).scalars().all()
+    for other in others:
+        _log(f"set-phone /{tenant_id}: freeing number from tenant {other.id} "
+             f"({other.business_name!r})")
+        other.twilio_phone_number = None
+        db.add(other)
+    if others:
+        await db.flush()
+
+    t.twilio_phone_number = number
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    _log(f"set-phone /{tenant_id}: COMMITTED twilio_phone_number={t.twilio_phone_number!r} "
+         f"(freed from {[o.id for o in others]})")
+    return {"success": True, "freed_from": [o.id for o in others],
             "data": _serialize(t)}
 
 
