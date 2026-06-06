@@ -4,7 +4,9 @@ Tenant management API — create and configure the businesses the platform serve
 These power the (future) admin dashboard. The routing-critical field is
 `twilio_phone_number`: the dialed number that maps an inbound call to this tenant.
 """
-from fastapi import APIRouter, Depends, HTTPException
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from pydantic import BaseModel, ConfigDict
@@ -14,6 +16,12 @@ from app.db.database import get_db
 from app.models.models import Tenant, Niche
 
 router = APIRouter()
+
+
+def _log(msg: str) -> None:
+    """Print to stdout so the line is always visible in the Railway log stream (the
+    codebase relies on print() for production diagnostics, not the logging module)."""
+    print(f"[tenants] {msg}", flush=True)
 
 
 class CreateTenant(BaseModel):
@@ -124,21 +132,53 @@ _UPDATABLE_FIELDS = {
 
 
 @router.patch("/{tenant_id}")
-async def update_tenant(tenant_id: str, data: UpdateTenant,
+async def update_tenant(tenant_id: str, data: UpdateTenant, request: Request,
                         db: AsyncSession = Depends(get_db)):
     """Partial update: apply ONLY the fields present in the request body, leave the rest
     unchanged, commit, then return the tenant re-read from the database.
 
     `exclude_unset=True` is what makes this a true PATCH — a field the caller omitted is
     absent from the dump and so is never touched, while a field they DID send (even to a
-    new value like a different twilio_phone_number) is applied and committed."""
+    new value like a different twilio_phone_number) is applied and committed.
+
+    Heavily instrumented (see the [tenants] log lines) because a 200-with-no-change almost
+    always means the body never arrived as parsed JSON (wrong Content-Type, an empty body,
+    or a proxy stripping it) — which the logs make obvious."""
+    # Raw body for diagnostics. Starlette caches the body, so reading it here is safe even
+    # though FastAPI already parsed it into `data`.
+    try:
+        raw_bytes = await request.body()
+        raw_text = raw_bytes.decode("utf-8") if raw_bytes else ""
+    except Exception as e:  # pragma: no cover - diagnostics must never break the request
+        raw_text = f"<unreadable: {type(e).__name__}>"
+    content_type = request.headers.get("content-type")
+    _log(f"PATCH /{tenant_id} content-type={content_type!r} raw_body={raw_text!r}")
+
     t = await db.get(Tenant, tenant_id)
     if not t:
         raise HTTPException(404, "Tenant not found")
 
-    # Only the fields the caller actually sent (not omitted, not just defaults).
-    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items()
-               if k in _UPDATABLE_FIELDS}
+    # The fields the caller actually sent (not omitted, not just schema defaults).
+    parsed = data.model_dump(exclude_unset=True)
+    _log(f"PATCH /{tenant_id} parsed model (exclude_unset)={parsed}")
+    updates = {k: v for k, v in parsed.items() if k in _UPDATABLE_FIELDS}
+
+    # DEFENSIVE FALLBACK: if the validated model carried no recognised fields but the client
+    # DID send a JSON object, apply the recognised keys straight from the raw body. This
+    # guarantees a PATCH with a real body can never be a silent no-op, whatever the body
+    # parsing did. (Validation already ran, so any value present here is well-formed.)
+    if not updates and raw_text:
+        try:
+            body_obj = json.loads(raw_text)
+            if isinstance(body_obj, dict):
+                updates = {k: v for k, v in body_obj.items() if k in _UPDATABLE_FIELDS}
+                if updates:
+                    _log(f"PATCH /{tenant_id} model had no fields; applied {sorted(updates)} "
+                         "from RAW body instead")
+        except (ValueError, TypeError) as e:
+            _log(f"PATCH /{tenant_id} raw body is not a JSON object ({type(e).__name__})")
+
+    _log(f"PATCH /{tenant_id} applying fields: {sorted(updates)}")
 
     # Reject a duplicate routing number up front (twilio_phone_number is UNIQUE).
     if updates.get("twilio_phone_number"):
@@ -154,6 +194,9 @@ async def update_tenant(tenant_id: str, data: UpdateTenant,
     db.add(t)
     await db.commit()
     await db.refresh(t)
+    _log(f"PATCH /{tenant_id} COMMITTED -> twilio_phone_number={t.twilio_phone_number!r} "
+         f"business_name={t.business_name!r} niche={t.niche.value if t.niche else None} "
+         f"is_active={t.is_active}")
     return {"success": True, "updated_fields": sorted(updates.keys()),
             "data": _serialize(t)}
 
