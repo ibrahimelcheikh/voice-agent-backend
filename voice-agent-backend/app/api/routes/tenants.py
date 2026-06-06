@@ -113,20 +113,49 @@ async def get_tenant(tenant_id: str, db: AsyncSession = Depends(get_db)):
     return {"data": _serialize(t)}
 
 
+# Every tenant column a PATCH may change. The request is validated into UpdateTenant, so
+# only these names can ever reach the model; listing them here also guards against an
+# unexpected key being setattr'd onto the ORM object.
+_UPDATABLE_FIELDS = {
+    "business_name", "niche", "twilio_phone_number", "default_language",
+    "supported_languages", "timezone", "greeting_message", "knowledge_base",
+    "config", "is_active",
+}
+
+
 @router.patch("/{tenant_id}")
 async def update_tenant(tenant_id: str, data: UpdateTenant,
                         db: AsyncSession = Depends(get_db)):
+    """Partial update: apply ONLY the fields present in the request body, leave the rest
+    unchanged, commit, then return the tenant re-read from the database.
+
+    `exclude_unset=True` is what makes this a true PATCH — a field the caller omitted is
+    absent from the dump and so is never touched, while a field they DID send (even to a
+    new value like a different twilio_phone_number) is applied and committed."""
     t = await db.get(Tenant, tenant_id)
     if not t:
         raise HTTPException(404, "Tenant not found")
-    updates = data.model_dump(exclude_unset=True)
-    if "twilio_phone_number" in updates and updates["twilio_phone_number"]:
+
+    # Only the fields the caller actually sent (not omitted, not just defaults).
+    updates = {k: v for k, v in data.model_dump(exclude_unset=True).items()
+               if k in _UPDATABLE_FIELDS}
+
+    # Reject a duplicate routing number up front (twilio_phone_number is UNIQUE).
+    if updates.get("twilio_phone_number"):
         if await _number_in_use(db, updates["twilio_phone_number"], exclude_id=tenant_id):
             raise HTTPException(409, "A tenant with this Twilio number already exists")
+
     for field, value in updates.items():
         setattr(t, field, value)
+
+    # Persist BEFORE returning. add() makes the intent explicit (t is already tracked);
+    # commit flushes the UPDATE; refresh re-reads the row so the response reflects exactly
+    # what is now in the database, not just the in-memory object.
+    db.add(t)
     await db.commit()
-    return {"success": True, "data": _serialize(t)}
+    await db.refresh(t)
+    return {"success": True, "updated_fields": sorted(updates.keys()),
+            "data": _serialize(t)}
 
 
 @router.put("/{tenant_id}/knowledge-base")
@@ -138,5 +167,7 @@ async def set_knowledge_base(tenant_id: str, data: KnowledgeBase,
     if not t:
         raise HTTPException(404, "Tenant not found")
     t.knowledge_base = data.knowledge_base
+    db.add(t)
     await db.commit()
+    await db.refresh(t)
     return {"success": True, "data": _serialize(t)}
