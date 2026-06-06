@@ -74,7 +74,14 @@ async def startup():
     # tenant and assign all pre-existing rows to it. No-op on a fresh DB (the seed already
     # scopes every row) and on an already-migrated DB.
     await backfill_default_tenant()
-    await configure_twilio_webhook()
+    # NOTE: We deliberately DO NOT reconfigure the Twilio number's voice webhook on boot.
+    # Inbound calls are routed via a Twilio Elastic SIP Trunk (Origination URI ->
+    # <proj>.sip.livekit.cloud) into the LiveKit inbound SIP trunk + dispatch rule, which
+    # creates the `call-<random>` room the agent worker auto-accepts. Programmatically
+    # pointing the number's voice_url at /twilio/inbound hijacks it onto Programmable Voice
+    # and breaks that SIP path (calls ring, nothing reaches the worker). The number must
+    # stay on the SIP trunk. Outbound reminders still work — they set their own
+    # status_callback per call in reminder_service (not on the number).
     start_reminder_scheduler()
 
     # Generate prerecorded greeting/goodbye/thinking clips (once) for fast call start.
@@ -139,24 +146,11 @@ async def shutdown():
             pass
 
 
-async def configure_twilio_webhook():
-    """Point the Twilio number's voice webhook + status callback at PUBLIC_URL."""
-    try:
-        from twilio.rest import Client
-        client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-        phone_numbers = client.incoming_phone_numbers.list()
-        for number in phone_numbers:
-            if number.phone_number == settings.TWILIO_PHONE_NUMBER:
-                number.update(
-                    voice_url=f"{settings.PUBLIC_URL}/twilio/inbound",
-                    voice_method="POST",
-                    status_callback=f"{settings.PUBLIC_URL}/twilio/status",
-                    status_callback_method="POST",
-                )
-                print(f"✅ Twilio webhook set to: {settings.PUBLIC_URL}/twilio/inbound")
-                break
-    except Exception as e:
-        print(f"⚠️ Could not auto-configure Twilio: {e}")
+# NOTE: configure_twilio_webhook() was intentionally REMOVED. Inbound calls must stay
+# routed through the Twilio Elastic SIP Trunk -> LiveKit inbound SIP trunk + dispatch rule
+# -> agent worker. Overriding the number's voice_url on boot broke that path. The
+# /twilio/inbound webhook route still exists for any tenant that opts into Programmable
+# Voice, but we never force a number onto it programmatically.
 
 
 # Routes

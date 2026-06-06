@@ -1,28 +1,15 @@
 """
-One-time (idempotent) LiveKit SIP setup for Twilio — MULTI-TENANT.
+One-time LiveKit SIP setup for Twilio.
 
     python scripts/setup_livekit_sip.py
 
-Creates an inbound SIP trunk that accepts calls dialed to ANY of our tenants' numbers and
-a dispatch rule that drops each incoming call into its own `call-<random>` room. The agent
-worker (automatic dispatch) then joins that room and resolves WHICH tenant from the dialed
-number on the SIP join.
+Creates an inbound SIP trunk (matching the Twilio number) and a dispatch rule
+that drops each incoming call into its own `call-<random>` room. The Pipecat /
+LiveKit agent then joins that room (triggered by the LiveKit `participant_joined`
+webhook — see app/api/routes/livekit_webhooks.py).
 
-WHY numbers=[] (accept any number):
-    The inbound trunk's `numbers` field gates which DIALED numbers LiveKit will accept. If
-    it is set to a single number, calls dialed to any OTHER number are REJECTED before a
-    room is ever created — so the agent worker is never offered a job and the call just
-    rings (this is exactly what broke multi-tenant inbound: each tenant has its own Twilio
-    number, but the trunk only accepted the original one). Leaving `numbers` EMPTY makes the
-    one trunk accept every tenant's number; the tenant is then resolved per-call from the
-    dialed number. Security is still enforced by `allowed_addresses` (Twilio's IPs only).
-
-This script is idempotent: it deletes any existing inbound trunks + dispatch rules first,
-then recreates a clean trunk (numbers=[]) and rule, so re-running it never leaves a stale,
-number-restricted trunk that would silently drop inbound calls.
-
-Requires LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET in the environment (.env).
-Run from the project root.
+Requires LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET / TWILIO_PHONE_NUMBER
+in the environment (.env). Run from the project root.
 """
 import asyncio
 import sys
@@ -50,35 +37,6 @@ def livekit_sip_host() -> str:
     return host.replace(".livekit.cloud", ".sip.livekit.cloud")
 
 
-async def _clear_existing(lk):
-    """Delete existing inbound trunks + dispatch rules so re-running yields a clean,
-    correct config (never a leftover number-restricted trunk that drops inbound calls).
-    Best-effort: a deletion failure is logged but doesn't abort the (re)create below."""
-    try:
-        rules = (await lk.sip.list_sip_dispatch_rule(api.ListSIPDispatchRuleRequest())).items
-        for r in rules:
-            try:
-                await lk.sip.delete_sip_dispatch_rule(
-                    api.DeleteSIPDispatchRuleRequest(sip_dispatch_rule_id=r.sip_dispatch_rule_id))
-                print(f"🧹 deleted old dispatch rule {r.sip_dispatch_rule_id}")
-            except Exception as e:
-                print(f"⚠️ could not delete dispatch rule {r.sip_dispatch_rule_id}: {e}")
-    except Exception as e:
-        print(f"⚠️ could not list dispatch rules: {e}")
-
-    try:
-        trunks = (await lk.sip.list_sip_inbound_trunk(api.ListSIPInboundTrunkRequest())).items
-        for t in trunks:
-            try:
-                await lk.sip.delete_sip_trunk(
-                    api.DeleteSIPTrunkRequest(sip_trunk_id=t.sip_trunk_id))
-                print(f"🧹 deleted old inbound trunk {t.sip_trunk_id} (numbers={list(t.numbers)})")
-            except Exception as e:
-                print(f"⚠️ could not delete inbound trunk {t.sip_trunk_id}: {e}")
-    except Exception as e:
-        print(f"⚠️ could not list inbound trunks: {e}")
-
-
 async def setup_sip():
     lk = api.LiveKitAPI(
         url=settings.LIVEKIT_URL.replace("wss://", "https://"),
@@ -86,23 +44,18 @@ async def setup_sip():
         api_secret=settings.LIVEKIT_API_SECRET,
     )
     try:
-        # 0) Clean slate — remove any prior (possibly number-restricted) trunk + rule.
-        await _clear_existing(lk)
-
-        # 1) Inbound SIP trunk — accepts calls to ANY tenant number from Twilio's IPs.
-        #    numbers=[] => match any dialed number (multi-tenant). The agent resolves the
-        #    tenant from the dialed number at call time.
+        # 1) Inbound SIP trunk — accepts calls to our Twilio number from Twilio's IPs.
         trunk = await lk.sip.create_sip_inbound_trunk(
             api.CreateSIPInboundTrunkRequest(
                 trunk=api.SIPInboundTrunkInfo(
-                    name="Twilio Inbound (multi-tenant)",
-                    numbers=[],                      # accept ANY dialed number
+                    name="Twilio Inbound",
+                    numbers=[settings.TWILIO_PHONE_NUMBER],
                     allowed_addresses=TWILIO_SIP_CIDRS,
-                    krisp_enabled=True,              # server-side noise cancellation
+                    krisp_enabled=True,  # server-side noise cancellation
                 )
             )
         )
-        print(f"✅ SIP inbound trunk created (accepts any number): {trunk.sip_trunk_id}")
+        print(f"✅ SIP inbound trunk created: {trunk.sip_trunk_id}")
 
         # 2) Dispatch rule — individual room per caller (room_prefix lives on Individual).
         rule = await lk.sip.create_sip_dispatch_rule(
@@ -121,18 +74,16 @@ async def setup_sip():
         sip_host = livekit_sip_host()
         number = settings.TWILIO_PHONE_NUMBER
         print("\n" + "=" * 64)
-        print("DONE. Inbound trunk now accepts ALL tenant numbers (multi-tenant).")
+        print("DONE. Point Twilio at LiveKit SIP.")
         print("=" * 64)
         print(f"\nLiveKit project SIP host (verify in Dashboard → Settings → SIP):")
         print(f"    {sip_host}")
         print(f"\nOption A — TwiML <Dial><Sip> (Programmable Voice, current setup):")
-        print(f"    app dials: sip:<dialed_tenant_number>@{sip_host};transport=tcp")
-        print(f"    (the trunk accepts any number; the agent resolves the tenant from it)")
+        print(f"    app already returns: sip:{number}@{sip_host};transport=tcp")
         print(f"\nOption B — Twilio Elastic SIP Trunk origination URI:")
         print(f"    sip:{sip_host};transport=tcp")
-        print(f"\nTwilio voice webhook (each tenant number → POST):")
-        print(f"    {settings.PUBLIC_URL}/twilio/inbound")
-        print(f"\nReference Twilio number: {number}")
+        print(f"\nThen set the LiveKit webhook (Dashboard → Settings → Webhooks):")
+        print(f"    {settings.PUBLIC_URL}/livekit/webhook")
     finally:
         await lk.aclose()
 
