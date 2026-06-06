@@ -319,3 +319,118 @@ class InsuranceProvider(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     clinic = relationship("Clinic", foreign_keys=[clinic_id])
+
+
+# ── Restaurant domain (niche = restaurant) ────────────────────────────────
+# Reservations + menu-aware pickup orders. The agent reads the tenant's real
+# MenuItem rows to take an order — it may NEVER invent a dish or a price (the same
+# anti-hallucination guarantee the clinic appointment flow gives).
+#
+# NOTE on table names: an earlier build of this codebase left ORPHAN tables named
+# `reservations` and `orders` (old restaurant schema) on persistent deploys. To avoid
+# create_all(checkfirst=True) silently skipping a name-colliding stale table, these new
+# tables use distinct names (restaurant_*). The orphans are dropped on boot
+# (database.drop_orphan_tables).
+
+class ReservationStatus(str, enum.Enum):
+    booked = "booked"
+    confirmed = "confirmed"
+    cancelled = "cancelled"
+    seated = "seated"
+    completed = "completed"
+    no_show = "no_show"
+
+
+class OrderStatus(str, enum.Enum):
+    received = "received"
+    preparing = "preparing"
+    ready = "ready"
+    done = "done"
+    cancelled = "cancelled"
+
+
+class Reservation(Base):
+    __tablename__ = "restaurant_reservations"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    customer_name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    party_size = Column(Integer, default=2)
+    date = Column(String, nullable=False)           # YYYY-MM-DD
+    time = Column(String, nullable=False)           # HH:MM (24h)
+    notes = Column(Text, nullable=True)
+    status = Column(SAEnum(ReservationStatus), default=ReservationStatus.booked)
+    created_via = Column(String, default="voice")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class MenuItem(Base):
+    __tablename__ = "menu_items"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    price = Column(Integer, default=0)              # cents
+    category = Column(String, nullable=True)        # e.g. "Coffee", "Mains", "Desserts"
+    available = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class Order(Base):
+    __tablename__ = "restaurant_orders"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    customer_name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    pickup_time = Column(String, nullable=True)      # HH:MM (24h) or "ASAP"
+    status = Column(SAEnum(OrderStatus), default=OrderStatus.received)
+    total = Column(Integer, default=0)               # cents — sum of line items
+    notes = Column(Text, nullable=True)
+    created_via = Column(String, default="voice")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+    items = relationship("OrderItem", back_populates="order",
+                         cascade="all, delete-orphan")
+
+
+class OrderItem(Base):
+    __tablename__ = "restaurant_order_items"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    order_id = Column(String, ForeignKey("restaurant_orders.id"), nullable=False)
+    menu_item_id = Column(String, ForeignKey("menu_items.id"), nullable=True)
+    name = Column(String, nullable=False)            # snapshot of the item name at order time
+    quantity = Column(Integer, default=1)
+    unit_price = Column(Integer, default=0)          # cents (snapshot)
+    line_total = Column(Integer, default=0)          # cents (unit_price * quantity)
+    order = relationship("Order", back_populates="items")
+
+
+# ── Lead capture domain (niche = real_estate / automotive / services) ─────────
+# A single flexible table covers all three verticals: the `lead_type` + `budget` +
+# `requirements` shape describes a property interest, a vehicle interest, or a service
+# request equally well. The agent collects these conversationally and saves immediately.
+
+class LeadStatus(str, enum.Enum):
+    new = "new"
+    contacted = "contacted"
+    closed = "closed"
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    name = Column(String, nullable=False)
+    phone = Column(String, nullable=False)
+    # What the caller is interested in: property type (real estate), vehicle interest
+    # (automotive), or service needed (services). One column serves all three.
+    lead_type = Column(String, nullable=True)
+    budget = Column(String, nullable=True)          # free-form ("$300k", "around 50k", "flexible")
+    requirements = Column(Text, nullable=True)      # extra detail / notes
+    status = Column(SAEnum(LeadStatus), default=LeadStatus.new)
+    created_via = Column(String, default="voice")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

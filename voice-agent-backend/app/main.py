@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
     appointments, patients, clinic_info, demo, livekit_webhooks, reminders,
-    tenants,
+    tenants, menu, reservations, orders, leads,
 )
 from app.db.database import engine, Base, reset_schema, ensure_columns, backfill_default_tenant
 from app.db.seed import seed_mock_data
@@ -172,6 +172,11 @@ app.include_router(livekit_webhooks.router, prefix="/livekit", tags=["LiveKit We
 app.include_router(appointments.router, prefix="/appointments", tags=["Appointments"])
 app.include_router(patients.router, prefix="/patients", tags=["Patients"])
 app.include_router(clinic_info.router, prefix="/clinic", tags=["Clinic Info"])
+# Niche-specific data (restaurant: menu/reservations/orders · lead capture: leads).
+app.include_router(menu.router, prefix="/menu", tags=["Restaurant — Menu"])
+app.include_router(reservations.router, prefix="/reservations", tags=["Restaurant — Reservations"])
+app.include_router(orders.router, prefix="/orders", tags=["Restaurant — Orders"])
+app.include_router(leads.router, prefix="/leads", tags=["Lead Capture"])
 app.include_router(demo.router, prefix="/demo", tags=["Demo"])
 app.include_router(reminders.router, prefix="/reminders", tags=["Reminders"])
 

@@ -22,7 +22,7 @@ import re
 import time
 from datetime import date, timedelta
 
-from app.agents.clinic_functions import CLINIC_FUNCTIONS
+from app.agents.niches import get_niche_spec
 
 logger = logging.getLogger("clinic-agent.guardrail")
 
@@ -78,68 +78,26 @@ def _resolve_relative_date(text: str, today_iso: str) -> str | None:
         return (today + timedelta(days=7)).isoformat()
     return None
 
-INTENTS = [
-    "book_appointment", "cancel_appointment", "reschedule_appointment",
-    "confirm_appointment", "check_appointment", "clinic_hours", "clinic_location",
-    "services_offered", "doctor_availability", "insurance_question",
-    "speak_to_human", "end_call", "unclear",
-]
+# Which intents/entities/functions are in play is NICHE-SPECIFIC and now lives in
+# app/agents/niches.py (NicheSpec). The GuardrailBrain loads the spec for the tenant's
+# niche, so a restaurant agent never offers "book_appointment" and a clinic agent never
+# offers "take_order". The deterministic helpers below (affirmation / closing / relative
+# date) are niche-agnostic and shared by every niche.
 
-# Single function the classifier is forced to call.
-_ROUTER_TOOL = [{
-    "type": "function",
-    "function": {
-        "name": "route_intent",
-        "description": "Classify the caller's latest message into one clinic intent and extract any entities.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "intent": {"type": "string", "enum": INTENTS},
-                "language": {"type": "string", "enum": list(LANGUAGES),
-                             "description": "Language the caller is speaking."},
-                "patient_name": {"type": "string"},
-                "phone": {"type": "string", "description": "Digits only if given."},
-                "doctor": {"type": "string", "description": "Doctor name or specialty mentioned."},
-                "date": {"type": "string", "description": "Resolved appointment date, YYYY-MM-DD."},
-                "time": {"type": "string", "description": "Resolved time, 24h HH:MM."},
-                "new_date": {"type": "string", "description": "Reschedule target date, YYYY-MM-DD."},
-                "new_time": {"type": "string", "description": "Reschedule target time, HH:MM."},
-                "reason": {"type": "string", "description": "Reason for the visit."},
-                "appointment_id": {"type": "string"},
-                "insurance_provider": {"type": "string"},
-            },
-            "required": ["intent", "language"],
-        },
-    },
-}]
-
-_ENTITY_KEYS = ["patient_name", "phone", "doctor", "date", "time", "new_date",
-                "new_time", "reason", "appointment_id", "insurance_provider"]
-
-_FUNCTION_ARGS = {
-    "book_appointment": ["patient_name", "phone", "doctor", "date", "time", "reason"],
-    "cancel_appointment": ["phone", "appointment_id"],
-    "reschedule_appointment": ["phone", "new_date", "new_time", "appointment_id"],
-    "confirm_appointment": ["phone", "appointment_id"],
-    "check_appointment": ["phone"],
-    "clinic_hours": [],
-    "clinic_location": [],
-    "services_offered": [],
-    "doctor_availability": ["doctor", "date"],
-    "insurance_question": ["insurance_provider"],
-}
-
-# Intents that DO something and can sit "pending" awaiting confirmation / a missing
-# detail. A bare "yes" right after the agent asked to confirm one of these resolves
-# back to it (see GuardrailBrain._pending_intent).
-_ACTIONABLE = {"book_appointment", "cancel_appointment", "reschedule_appointment",
-               "confirm_appointment"}
-
-# Successful actionable intent -> the reminder outcome to record on the appointment.
-_INTENT_OUTCOME = {
-    "confirm_appointment": "confirmed",
-    "reschedule_appointment": "rescheduled",
-    "cancel_appointment": "cancelled",
+# Per-intent guidance when a primary "create" action fired but isn't complete yet (a
+# required detail is missing, or — for orders — the caller named something off-menu). The
+# clinic's book_appointment text is kept verbatim so existing behavior is unchanged.
+_INCOMPLETE_TASK = {
+    "book_appointment": ("The booking is not complete. Politely ask only for the missing "
+                         "detail(s); do not confirm a booking."),
+    "create_reservation": ("The reservation is not complete. Politely ask only for the "
+                           "missing detail(s); do not confirm it yet."),
+    "take_order": ("The order is not complete, or includes something not on the menu. "
+                   "Politely tell the caller what is unavailable (offer a real menu "
+                   "alternative) or ask for the missing detail(s); NEVER invent a dish or "
+                   "price; do not confirm the order yet."),
+    "capture_lead": ("Some details are still missing. Politely ask only for the missing "
+                     "detail(s) before confirming."),
 }
 
 # Short affirmations that confirm a pending action. These must NEVER be treated as
@@ -214,14 +172,20 @@ class GuardrailBrain:
 
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
                  max_unclear: int = 5, seed_entities: dict | None = None,
-                 pending_intent: str | None = None, tenant_id: str | None = None):
+                 pending_intent: str | None = None, tenant_id: str | None = None,
+                 niche: str | None = None):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
         self._today = today
-        # Tenant whose data this call operates on. Passed into every clinic function so
+        # Tenant whose data this call operates on. Passed into every data function so
         # the agent can only ever read/write THIS business's data — no cross-tenant leak.
         self._tenant_id = tenant_id
+        # The tenant's niche decides which function set + intents are in play (clinic ->
+        # appointments, restaurant -> reservations/orders, real_estate/automotive/services
+        # -> lead capture). Defaults to the clinic spec when unknown.
+        self._niche = niche
+        self._spec = get_niche_spec(niche)
         # Human-readable today (with weekday) so the classifier can compute "next Monday".
         try:
             self._today_human = date.fromisoformat(today).strftime("%A, %B %d, %Y")
@@ -319,18 +283,28 @@ class GuardrailBrain:
 
         # Merge (never overwrite-and-forget) entities across turns. `contributed` tracks
         # whether this turn added/changed any detail — a turn that moves the booking
-        # forward must reset the unclear streak even if the intent looked thin.
+        # forward must reset the unclear streak even if the intent looked thin. List
+        # entities (e.g. a restaurant order's `items`) are REPLACED with the latest
+        # non-empty extraction: the classifier is told to always return the full running
+        # list, so the newest one is authoritative.
         contributed = False
-        for k in _ENTITY_KEYS:
-            if extracted.get(k) and self.entities.get(k) != extracted[k]:
-                self.entities[k] = extracted[k]
+        for k in self._spec.entity_keys:
+            val = extracted.get(k)
+            if not val:
+                continue
+            if k in self._spec.list_entities:
+                if self.entities.get(k) != val:
+                    self.entities[k] = val
+                    contributed = True
+            elif self.entities.get(k) != val:
+                self.entities[k] = val
                 contributed = True
 
         # Deterministic relative-date resolution — so we never ask the caller for a
         # calendar date even if the classifier left it relative/blank.
         resolved = _resolve_relative_date(user_text, self._today)
         if resolved:
-            field = "new_date" if intent == "reschedule_appointment" else "date"
+            field = "new_date" if intent in self._spec.reschedule_intents else "date"
             if not _is_iso_date(self.entities.get(field)):
                 self.entities[field] = resolved
                 contributed = True
@@ -340,11 +314,12 @@ class GuardrailBrain:
             # Already-settled appointment + a bare acknowledgement: respond briefly and
             # DO NOT call any function or re-read the appointment (Fix 1 & 3).
             self._unclear_streak = 0
+            noun = self._spec.settled_noun
             return {"instruction": self._wrap(last_assistant,
-                    {"situation": "The appointment is already booked and confirmed; the caller "
+                    {"situation": f"The {noun} is already booked and confirmed; the caller "
                                   "is simply acknowledging — not asking for anything new.",
                      "task": "Give a brief acknowledgement such as \"You're all set — anything "
-                             "else?\". Do NOT repeat or re-read the appointment details, and do "
+                             f"else?\". Do NOT repeat or re-read the {noun} details, and do "
                              "not state any new information."}),
                     "intent": "acknowledge", "data": {}, "end": None, "transfer": False}
 
@@ -382,13 +357,13 @@ class GuardrailBrain:
         # progress — reset the unclear streak so an earlier hiccup never triggers a handoff.
         self._unclear_streak = 0
         # Remember an actionable intent so a follow-up "yes" / bare detail resolves to it.
-        if intent in _ACTIONABLE:
+        if intent in self._spec.actionable:
             self._pending_intent = intent
 
-        func = CLINIC_FUNCTIONS.get(intent)
+        func = self._spec.functions.get(intent)
         data = {}
         if func:
-            kwargs = {k: self.entities.get(k) for k in _FUNCTION_ARGS.get(intent, [])}
+            kwargs = {k: self.entities.get(k) for k in self._spec.function_args.get(intent, [])}
             # Scope every data function to this call's tenant (anti-cross-tenant guard).
             kwargs["tenant_id"] = self._tenant_id
             tf = time.perf_counter()
@@ -405,18 +380,17 @@ class GuardrailBrain:
         # Once an actionable request succeeds, clear the pending flag so a later "yes"
         # can't accidentally repeat it (e.g. re-book the same appointment), and record
         # the reminder outcome (confirmed / rescheduled / cancelled).
-        if intent in _ACTIONABLE and isinstance(data, dict) and data.get("success"):
+        if intent in self._spec.actionable and isinstance(data, dict) and data.get("success"):
             self._pending_intent = None
-            # Mark the appointment settled so a follow-up affirmation acknowledges rather
-            # than re-running confirm + re-reading the appointment (the re-confirmation loop).
+            # Mark settled so a follow-up affirmation acknowledges rather than re-running
+            # the action + re-reading it back (the re-confirmation loop).
             self._settled = True
-            if intent in _INTENT_OUTCOME:
-                self.reminder_outcome = _INTENT_OUTCOME[intent]
+            if intent in self._spec.intent_outcome:
+                self.reminder_outcome = self._spec.intent_outcome[intent]
 
         payload = {"intent": intent, "data": data}
-        if intent == "book_appointment" and not data.get("success"):
-            payload["task"] = ("The booking is not complete. Politely ask only for the missing "
-                               "detail(s); do not confirm a booking.")
+        if isinstance(data, dict) and not data.get("success") and intent in _INCOMPLETE_TASK:
+            payload["task"] = _INCOMPLETE_TASK[intent]
         return {"instruction": self._wrap(last_assistant, payload),
                 "intent": intent, "data": data, "end": None, "transfer": False}
 
@@ -424,15 +398,16 @@ class GuardrailBrain:
                         pending_intent: str | None = None, entities: dict | None = None,
                         settled: bool = False):
         sys = (
-            f"You route a medical-clinic phone call. Today is {self._today_human} "
+            f"You route {self._spec.classifier_subject}. Today is {self._today_human} "
             f"({self._today}). Classify the caller's latest message into exactly one intent "
             "and extract entities. ALWAYS compute relative dates yourself from today's date — "
             "'tomorrow', 'this Friday', 'next Monday at 3pm', 'next week' — into absolute "
             "YYYY-MM-DD and 24h HH:MM. NEVER leave a date relative and never expect the caller "
             "to give a calendar date. Detect the spoken language (en/ar/fr/es). "
             "If the caller signals they are finished — 'that's it', 'that's all', 'no thanks', "
-            "'thank you', 'goodbye', 'I'm done' — classify as 'end_call', even right after a "
-            "booking or confirmation; a sign-off is NEVER 'confirm_appointment'. "
+            "'thank you', 'goodbye', 'I'm done' — classify as 'end_call', even right after "
+            "completing a request; a sign-off is NEVER a confirmation. Use intent 'faq' for "
+            "general questions (hours, location, policies, pricing, products). "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
 
@@ -443,8 +418,8 @@ class GuardrailBrain:
         if last_assistant:
             ctx.append(f'The assistant just said: "{last_assistant}"')
         if settled:
-            ctx.append("The appointment has ALREADY been booked and confirmed this call "
-                       "(the assistant has already read it back once).")
+            ctx.append(f"The {self._spec.settled_noun} has ALREADY been completed and "
+                       "confirmed this call (the assistant has already read it back once).")
         if pending_intent:
             ctx.append(f"An action is already in progress and awaiting completion: "
                        f"{pending_intent}.")
@@ -458,20 +433,19 @@ class GuardrailBrain:
                 + "\n\nRULES FOR SHORT REPLIES:\n"
                 "- If the caller signals they are finished (that's it / that's all / no "
                 "thanks / thank you / goodbye / I'm done), classify as 'end_call' — even "
-                "right after a booking. A sign-off is never 'confirm_appointment'.\n"
-                + ("- The appointment is ALREADY confirmed. A bare acknowledgement (yes / "
-                   "that's correct / great / okay / perfect) is NOT a request to confirm "
-                   "again — classify it as 'unclear' (a simple acknowledgement) unless the "
-                   "caller clearly asks for something new. Use 'check_appointment' only if "
-                   "they explicitly ask what/when their appointment is or to repeat it.\n"
+                "right after completing a request. A sign-off is never a confirmation.\n"
+                + (f"- The {self._spec.settled_noun} is ALREADY confirmed. A bare "
+                   "acknowledgement (yes / that's correct / great / okay / perfect) is NOT a "
+                   "request to do it again — classify it as 'unclear' (a simple "
+                   "acknowledgement) unless the caller clearly asks for something new.\n"
                    if settled else
                    "- If the assistant just asked the caller to confirm an action and the "
                    "caller responds affirmatively (yes / yeah / correct / that's right / "
                    "go ahead / sure / please do), classify the intent as the pending action "
                    f"({pending_intent or 'the action in progress'}) — NOT 'unclear' — and "
                    "carry the already-collected entities forward.\n")
-                + "- If the caller gives a bare detail (a phone number, a name, a time, a "
-                "doctor) that fills a missing field for the pending action, classify it as "
+                + "- If the caller gives a bare detail (a phone number, a name, a time, an "
+                "item) that fills a missing field for the pending action, classify it as "
                 "that pending action and extract the new entity.\n"
                 "- Only use 'unclear' when the caller's message truly cannot be tied to "
                 "any intent or to the action in progress."
@@ -484,32 +458,32 @@ class GuardrailBrain:
         resp = await self._client.chat.completions.create(
             model=self._model,
             messages=messages,
-            tools=_ROUTER_TOOL,
+            tools=self._spec.router_tool(),
             tool_choice={"type": "function", "function": {"name": "route_intent"}},
             temperature=0,
-            max_tokens=300,
+            max_tokens=400,
             timeout=_CLASSIFY_TIMEOUT,
         )
         call = resp.choices[0].message.tool_calls[0]
         args = json.loads(call.function.arguments or "{}")
         intent = args.get("intent", "unclear")
         language = args.get("language", "en")
-        extracted = {k: args[k] for k in _ENTITY_KEYS if args.get(k)}
+        extracted = {k: args[k] for k in self._spec.entity_keys if args.get(k)}
         return intent, extracted, language
 
     def _wrap(self, last_assistant: str, payload: dict) -> str:
         """Build the strict per-turn system instruction around a data payload."""
         lang_name = LANGUAGES.get(self.language, "English")
         guard = (
-            "You are the AI receptionist for a medical clinic. You may ONLY use the information "
-            "provided below. NEVER invent appointment times, prices, doctor names, policies, or "
-            "insurance details. If the data is empty or a request failed, apologise briefly and "
-            "offer to connect them to staff. When a date is already known, confirm it back to the "
-            "caller (e.g. 'Monday, June 9') — NEVER ask the caller to provide a calendar date; "
-            "relative dates like 'next Monday' are already resolved for you. "
-            "You are on a PHONE call: reply in ONE short sentence, MAXIMUM 15 words, like a real "
-            "receptionist. Never list more than 2 items — when listing services or insurers, give "
-            "only the top 2-3 then ask if they want more. "
+            f"You are {self._spec.assistant_role}. You may ONLY use the information provided "
+            "below. NEVER invent any facts — times, prices, names, menu items, dishes, "
+            "services, policies, availability, or insurance details. If the data is empty or a "
+            "request failed, apologise briefly and offer to connect them to staff. When a date "
+            "is already known, confirm it back to the caller (e.g. 'Monday, June 9') — NEVER "
+            "ask the caller to provide a calendar date; relative dates like 'next Monday' are "
+            "already resolved for you. You are on a PHONE call: reply in ONE short sentence, "
+            "MAXIMUM 15 words, like a real receptionist. Never list more than 2-3 items — give "
+            "only the top few then ask if they want more. "
             f"Reply in {lang_name}. Do not greet again."
         )
         if last_assistant:
@@ -536,9 +510,10 @@ class IntentGuardrailProcessor:
 
         class _Impl(FrameProcessor):
             def __init__(self, *, openai_api_key, today, model="gpt-4o-mini",
-                         on_end_call=None, on_state=None, **kw):
+                         on_end_call=None, on_state=None, tenant_id=None, niche=None, **kw):
                 super().__init__(**kw)
-                self._brain = GuardrailBrain(openai_api_key=openai_api_key, today=today, model=model)
+                self._brain = GuardrailBrain(openai_api_key=openai_api_key, today=today,
+                                             model=model, tenant_id=tenant_id, niche=niche)
                 self._on_end_call = on_end_call
                 self._on_state = on_state
                 self._ended = False

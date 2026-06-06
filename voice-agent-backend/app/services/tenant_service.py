@@ -94,6 +94,28 @@ async def resolve_tenant_id(db, tenant_id: str | None) -> str | None:
     return default.id if default else None
 
 
+async def resolve_tenant_id_for_niche(db, tenant_id: str | None, niches) -> str | None:
+    """Resolve a tenant_id for a niche-specific endpoint (menu/reservations/orders/leads).
+
+    If a tenant_id is supplied it is validated and used. Otherwise we pick the first active
+    tenant whose niche is in `niches` (so POST /menu/quick with no body still lands on the
+    restaurant tenant during /docs testing). Falls back to the default tenant when there is
+    no niche match. `niches` is a string or an iterable of niche values."""
+    if tenant_id:
+        t = (await db.execute(select(Tenant).where(Tenant.id == tenant_id))).scalars().first()
+        if t:
+            return t.id
+    wanted = {niches} if isinstance(niches, str) else set(niches)
+    t = (await db.execute(
+        select(Tenant).where(Tenant.is_active == True)  # noqa: E712
+        .order_by(Tenant.created_at)
+    )).scalars().all()
+    for tenant in t:
+        if tenant.niche and tenant.niche.value in wanted:
+            return tenant.id
+    return await resolve_tenant_id(db, None)
+
+
 async def load_tenant_config(db, tenant: Tenant) -> dict:
     """Build the config dict the agent session runs from for a given tenant: greeting,
     system prompt, voice, call-duration cap, language, and knowledge base. The system
@@ -151,6 +173,25 @@ def sip_called_number(room) -> str | None:
         attrs = getattr(p, "attributes", None) or {}
         for key in ("sip.trunkPhoneNumber", "sip.to_number", "sip.dnis",
                     "sip.calledNumber", "sip.ruleID"):
+            val = attrs.get(key)
+            if val and re.search(r"\d", val):
+                return val
+    return None
+
+
+def sip_caller_number(room) -> str | None:
+    """Best-effort CALLER (origin) number for a LiveKit SIP call — i.e. the number the
+    person is calling FROM. Used for caller recognition (greet a returning caller by name).
+    LiveKit exposes it on the SIP participant attributes (sip.phoneNumber is the caller;
+    sip.from_number on some setups). Distinct from sip_called_number (the dialed/tenant
+    number). Returns None when it can't be read."""
+    try:
+        participants = list(getattr(room, "remote_participants", {}).values())
+    except Exception:
+        return None
+    for p in participants:
+        attrs = getattr(p, "attributes", None) or {}
+        for key in ("sip.phoneNumber", "sip.from_number", "sip.from", "sip.ani"):
             val = attrs.get(key)
             if val and re.search(r"\d", val):
                 return val

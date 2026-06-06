@@ -381,17 +381,19 @@ def _make_agent_class():
 
     class ClinicAgent(Agent):
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
-                     seed_entities=None, pending_intent=None, tenant_id=None):
+                     seed_entities=None, pending_intent=None, tenant_id=None, niche=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
             # confirms the right appointment and reschedule/cancel target it directly.
-            # tenant_id scopes every data function to this caller's business.
+            # tenant_id scopes every data function to this caller's business; niche selects
+            # which function set + intents are loaded (clinic -> appointments, restaurant ->
+            # reservations/orders, real_estate/automotive/services -> lead capture).
             self._brain = GuardrailBrain(openai_api_key=settings.OPENAI_API_KEY,
                                          today=date.today().isoformat(),
                                          seed_entities=seed_entities,
                                          pending_intent=pending_intent,
-                                         tenant_id=tenant_id)
+                                         tenant_id=tenant_id, niche=niche)
             self._on_state = on_state
             self._on_end = on_end
             self._greeting = greeting or GREETING
@@ -468,6 +470,9 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     if reminder and call_context.get("tenant_id"):
         tenant_id = call_context["tenant_id"]
 
+    # The tenant's niche selects which function set + intents the guardrail loads.
+    niche = (behavior_config or {}).get("niche") or "clinic"
+
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
     state = {"language": "en", "entities": {}}
     end_reason = {"r": None}
@@ -501,10 +506,26 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
         greeting = (behavior_config or {}).get("greeting_message") or GREETING
         seed_entities = None
         pending_intent = None
+        # CALLER RECOGNITION (all niches): look the caller's number up within THIS tenant's
+        # records. If they're known, greet them by name and seed their phone so the agent
+        # never re-asks for it. Best-effort + strictly tenant-scoped — never blocks the call.
+        try:
+            recognized = await _recognize_caller(room, tenant_id, niche)
+        except Exception as e:
+            print(f"[agent] caller recognition failed: {type(e).__name__}: {e}")
+            recognized = None
+        if recognized and recognized.get("found"):
+            name = recognized.get("name")
+            phone = recognized.get("phone")
+            name_key = "patient_name" if niche in ("clinic", "dental", "spa") else "customer_name"
+            seed_entities = {k: v for k, v in {name_key: name, "phone": phone}.items() if v}
+            if name:
+                greeting = f"Hello {name.split()[0]}, " + greeting[0].lower() + greeting[1:]
+            _log(f"recognized returning caller {name!r} ({phone})")
 
     agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end,
                                 greeting=greeting, seed_entities=seed_entities,
-                                pending_intent=pending_intent, tenant_id=tenant_id)
+                                pending_intent=pending_intent, tenant_id=tenant_id, niche=niche)
 
     room.on("disconnected", lambda *_a: done.set())
 
@@ -646,6 +667,26 @@ async def _resolve_tenant(room):
     except Exception as e:
         print(f"[agent] tenant resolve failed: {type(e).__name__}: {e}")
         return None, {}
+
+
+async def _recognize_caller(room, tenant_id, niche):
+    """Read the caller's number off the SIP join and look them up within THIS tenant's
+    records (patients / reservations / orders / leads, by niche). Returns the recognition
+    dict ({found, name, phone, ...}) or None. Strictly tenant-scoped; never raises into
+    the call path."""
+    try:
+        from app.services.tenant_service import sip_caller_number
+        from app.agents.common_functions import recognize_caller
+        caller = sip_caller_number(room)
+        if not caller:
+            return None
+        result = await recognize_caller(phone=caller, niche=niche, tenant_id=tenant_id)
+        if result:
+            result.setdefault("phone", caller)
+        return result
+    except Exception as e:
+        print(f"[agent] _recognize_caller error: {type(e).__name__}: {e}")
+        return None
 
 
 async def _create_call_record(tenant_id, config, room_name, caller):

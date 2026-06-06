@@ -13,6 +13,8 @@ from app.models.models import (
     Clinic, Doctor, Service, Patient, Appointment, InsuranceProvider,
     Niche, UserRole, AgentType, AgentStatus, CallDirection, CallOutcome, CampaignStatus,
     AppointmentStatus,
+    MenuItem, Reservation, ReservationStatus, Order, OrderItem, OrderStatus,
+    Lead, LeadStatus,
 )
 from datetime import datetime, timedelta, date
 import random
@@ -125,9 +127,16 @@ async def seed_mock_data():
         _seed_calls(db)
         _seed_whatsapp(db)
 
+        # Extra demo tenants on OTHER niches so phone -> tenant -> niche-specific function
+        # routing is demonstrable end-to-end (clinic stays Tenant 1, untouched).
+        await _seed_restaurant_tenant(db)
+        await _seed_lead_tenant(db)
+        await db.flush()
+
         await db.commit()
         print("[seed] Prime Health Clinic demo seeded "
               "(5 doctors · 8 services · 60 patients · 100 appointments · 6 insurers)")
+        print("[seed] + restaurant tenant (Golden Fork) and real-estate tenant (Aloqda Realty)")
 
 
 async def _clear_seed_tables(db):
@@ -137,6 +146,7 @@ async def _clear_seed_tables(db):
     for model in (
         Appointment, WhatsAppMessage, WhatsAppConversation, Call, Campaign,
         Patient, Service, Doctor, InsuranceProvider, Clinic,
+        OrderItem, Order, Reservation, MenuItem, Lead,
         Agent, BehaviorConfig, User, Tenant,
     ):
         await db.execute(delete(model))
@@ -400,3 +410,174 @@ def _seed_whatsapp(db):
         ("agent", "You're welcome — take care!"),
     ]:
         db.add(WhatsAppMessage(conversation_id="wa-001", role=role, content=content))
+
+
+# ── Tenant 2 — Golden Fork (restaurant niche) ─────────────────────────────────
+
+RESTAURANT_TENANT_ID = "tenant-002"
+RESTAURANT_PHONE = "+16575347700"
+
+# (name, category, price_cents, description)
+MENU = [
+    ("Espresso", "Coffee", 350, "Double shot of house espresso."),
+    ("Cappuccino", "Coffee", 500, "Espresso with steamed milk and foam."),
+    ("Caramel Latte", "Coffee", 600, "Espresso, steamed milk, caramel."),
+    ("Fresh Orange Juice", "Drinks", 550, "Freshly squeezed oranges."),
+    ("Avocado Toast", "Food", 900, "Sourdough, smashed avocado, chili flakes."),
+    ("Halloumi Sandwich", "Food", 1100, "Grilled halloumi, tomato, pesto on ciabatta."),
+    ("Chicken Caesar Salad", "Food", 1300, "Grilled chicken, romaine, parmesan, croutons."),
+    ("Beef Burger", "Food", 1500, "Angus beef, cheddar, house sauce, fries."),
+    ("Chocolate Cake", "Desserts", 700, "Rich flourless chocolate cake."),
+    ("Cheesecake", "Desserts", 750, "New York style cheesecake."),
+]
+
+
+async def _seed_restaurant_tenant(db):
+    """A second tenant on the restaurant niche so reservations + menu-aware orders are
+    demonstrable. Its own Twilio number routes inbound calls here and loads the restaurant
+    function set (not appointments)."""
+    db.add(Tenant(
+        id=RESTAURANT_TENANT_ID,
+        business_name="Golden Fork",
+        niche=Niche.restaurant,
+        twilio_phone_number=RESTAURANT_PHONE,
+        default_language="en",
+        supported_languages=["en", "ar"],
+        timezone="Asia/Beirut",
+        greeting_message="Thank you for calling Golden Fork. This is the AI host, how can I help?",
+        knowledge_base={
+            "hours": {"mon": "8:00 AM - 11:00 PM", "tue": "8:00 AM - 11:00 PM",
+                      "wed": "8:00 AM - 11:00 PM", "thu": "8:00 AM - 11:00 PM",
+                      "fri": "8:00 AM - 1:00 AM", "sat": "8:00 AM - 1:00 AM",
+                      "sun": "9:00 AM - 11:00 PM"},
+            "location": "Gemmayze, Rue Gouraud, Beirut, Lebanon",
+            "phone": RESTAURANT_PHONE,
+            "parking": "Valet parking available in the evenings.",
+            "policies": "Reservations held for 15 minutes. Pickup orders ready in 20-30 minutes.",
+            "dietary": "Vegetarian and gluten-free options available.",
+        },
+        config={"reservation_window_days": 30, "max_party_size": 12,
+                "pickup_lead_minutes": 20},
+    ))
+    await db.flush()  # tenant must exist before its FK children (config/agent/menu/...)
+    db.add(User(id="usr-rest-001", tenant_id=RESTAURANT_TENANT_ID, role=UserRole.owner,
+                name="Golden Fork Manager", email="manager@goldenfork.com",
+                password_hash=safe_hash("demo1234")))
+    rest_cfg = BehaviorConfig(
+        id="cfg-rest-001", tenant_id=RESTAURANT_TENANT_ID,
+        name="Golden Fork — Host (Inbound)", version=1,
+        system_prompt=(
+            "You are the AI host for Golden Fork restaurant. You may ONLY state information "
+            "returned by your functions — NEVER invent a dish, a price, a table, or an order. "
+            "Take reservations and pickup orders, and answer questions from the knowledge base. "
+            "Keep replies short and natural, like a real host. Offer staff if you lack the data."),
+        hard_rules=[
+            {"rule": "Only offer menu items that exist and are available", "enabled": True},
+            {"rule": "Never invent dishes or prices", "enabled": True},
+            {"rule": "Read the order back with itemized total before saving", "enabled": True},
+        ],
+        soft_rules=[{"rule": "Suggest a popular item if the caller is unsure", "enabled": True}],
+        blocked_topics=["allergen medical advice"],
+        escalation_triggers=["complaint", "wants a manager", "large catering event"],
+        data_extraction_fields=["customer_name", "phone", "party_size", "date", "time", "items"],
+        max_call_duration=300, versions=[],
+    )
+    db.add(rest_cfg)
+    db.add(Agent(id="agt-rest-001", tenant_id=RESTAURANT_TENANT_ID,
+                 name="Golden Fork Host (Inbound)", type=AgentType.inbound,
+                 language="en", voice_id="shimmer", status=AgentStatus.active,
+                 behavior_config_id="cfg-rest-001", phone_number=RESTAURANT_PHONE,
+                 calls_today=8, total_calls=240, avg_score=90.0))
+    for i, (name, category, price, desc) in enumerate(MENU):
+        db.add(MenuItem(id=f"menu-{i+1:03d}", tenant_id=RESTAURANT_TENANT_ID, name=name,
+                        category=category, price=price, description=desc, available=True))
+    # A couple of sample reservations + one order so check/recognition have data.
+    db.add(Reservation(id="resv-001", tenant_id=RESTAURANT_TENANT_ID,
+                       customer_name="Sophie Martin", phone="+19610000001", party_size=4,
+                       date=(date.today() + timedelta(days=2)).isoformat(), time="20:00",
+                       notes="Window table if possible", status=ReservationStatus.booked,
+                       created_via="manual"))
+    db.add(Reservation(id="resv-002", tenant_id=RESTAURANT_TENANT_ID,
+                       customer_name="Tarek Nasser", phone="+19610000002", party_size=2,
+                       date=(date.today() + timedelta(days=5)).isoformat(), time="13:30",
+                       status=ReservationStatus.confirmed, created_via="voice"))
+    order = Order(id="ord-001", tenant_id=RESTAURANT_TENANT_ID, customer_name="Lara Aoun",
+                  phone="+19610000003", pickup_time="18:30", status=OrderStatus.received,
+                  total=2100, created_via="voice")
+    db.add(order)
+    db.add(OrderItem(tenant_id=RESTAURANT_TENANT_ID, order_id="ord-001",
+                     menu_item_id="menu-003", name="Caramel Latte", quantity=1,
+                     unit_price=600, line_total=600))
+    db.add(OrderItem(tenant_id=RESTAURANT_TENANT_ID, order_id="ord-001",
+                     menu_item_id="menu-008", name="Beef Burger", quantity=1,
+                     unit_price=1500, line_total=1500))
+
+
+# ── Tenant 3 — Aloqda Realty (real_estate niche, lead capture) ────────────────
+
+LEAD_TENANT_ID = "tenant-003"
+LEAD_PHONE = "+16575347711"
+
+
+async def _seed_lead_tenant(db):
+    """A third tenant on the real-estate niche so structured lead capture is demonstrable.
+    Same flexible Lead shape also serves automotive + services tenants."""
+    db.add(Tenant(
+        id=LEAD_TENANT_ID,
+        business_name="Aloqda Realty",
+        niche=Niche.real_estate,
+        twilio_phone_number=LEAD_PHONE,
+        default_language="en",
+        supported_languages=["en", "ar"],
+        timezone="Asia/Beirut",
+        greeting_message="Thank you for calling Aloqda Realty. This is the AI assistant, how can I help?",
+        knowledge_base={
+            "hours": {"mon": "9:00 AM - 6:00 PM", "tue": "9:00 AM - 6:00 PM",
+                      "wed": "9:00 AM - 6:00 PM", "thu": "9:00 AM - 6:00 PM",
+                      "fri": "9:00 AM - 6:00 PM", "sat": "10:00 AM - 2:00 PM",
+                      "sun": "Closed"},
+            "location": "Downtown, Beirut Souks, Beirut, Lebanon",
+            "phone": LEAD_PHONE,
+            "areas": "We cover Beirut, Metn, Kesrouan, and the South.",
+            "services": "Sales and rentals — apartments, villas, offices, and retail.",
+            "policies": "A specialist calls qualified leads back within one business day.",
+        },
+        config={"lead_followup_hours": 24},
+    ))
+    await db.flush()  # tenant must exist before its FK children (config/agent/leads)
+    db.add(User(id="usr-lead-001", tenant_id=LEAD_TENANT_ID, role=UserRole.owner,
+                name="Aloqda Realty Owner", email="owner@aloqdarealty.com",
+                password_hash=safe_hash("demo1234")))
+    lead_cfg = BehaviorConfig(
+        id="cfg-lead-001", tenant_id=LEAD_TENANT_ID,
+        name="Aloqda Realty — Lead Capture (Inbound)", version=1,
+        system_prompt=(
+            "You are the AI assistant for Aloqda Realty. Your job is to capture the caller's "
+            "details as a lead: their name, phone, the property type they want, their budget, "
+            "and any requirements. You may ONLY state information returned by your functions — "
+            "NEVER invent listings or prices. Save the lead, then let them know a specialist "
+            "will call back. Keep replies short and natural."),
+        hard_rules=[
+            {"rule": "Never invent property listings or prices", "enabled": True},
+            {"rule": "Always collect name and phone before saving a lead", "enabled": True},
+        ],
+        soft_rules=[{"rule": "Ask for budget and requirements to qualify the lead", "enabled": True}],
+        blocked_topics=["legal advice", "mortgage guarantees"],
+        escalation_triggers=["wants to speak to an agent now", "complaint"],
+        data_extraction_fields=["customer_name", "phone", "lead_type", "budget", "requirements"],
+        max_call_duration=300, versions=[],
+    )
+    db.add(lead_cfg)
+    db.add(Agent(id="agt-lead-001", tenant_id=LEAD_TENANT_ID,
+                 name="Aloqda Realty Assistant (Inbound)", type=AgentType.inbound,
+                 language="en", voice_id="nova", status=AgentStatus.active,
+                 behavior_config_id="cfg-lead-001", phone_number=LEAD_PHONE,
+                 calls_today=5, total_calls=130, avg_score=89.0))
+    db.add(Lead(id="lead-001", tenant_id=LEAD_TENANT_ID, name="Daniel Lee",
+                phone="+19620000001", lead_type="2-bedroom apartment",
+                budget="$250,000", requirements="Achrafieh, parking, balcony",
+                status=LeadStatus.new, created_via="voice"))
+    db.add(Lead(id="lead-002", tenant_id=LEAD_TENANT_ID, name="Priya Patel",
+                phone="+19620000002", lead_type="office space for rent",
+                budget="$2,000/month", requirements="Downtown, ~120 sqm",
+                status=LeadStatus.contacted, created_via="voice"))

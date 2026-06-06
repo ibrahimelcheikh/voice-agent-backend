@@ -32,6 +32,15 @@ async def ensure_columns():
     fail. `ADD COLUMN IF NOT EXISTS` is safe to run on every boot: it adds the column
     on the first deploy that needs it and no-ops thereafter. Never destroys data."""
     statements = [
+        # Drop dead ORPHAN tables left by the very first (restaurant-era) schema. They
+        # reference `agents` and are not in Base.metadata, so they (a) block a model-only
+        # drop_all and (b) — critically — share the names the niche feature might otherwise
+        # have reused. The new restaurant tables deliberately use distinct names
+        # (restaurant_reservations / restaurant_orders / menu_items), so dropping these
+        # legacy names is always safe and never touches live niche data.
+        "DROP TABLE IF EXISTS faqs CASCADE",
+        "DROP TABLE IF EXISTS orders CASCADE",
+        "DROP TABLE IF EXISTS reservations CASCADE",
         "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_sent_at TIMESTAMP",
         "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS reminder_outcome VARCHAR",
         "ALTER TABLE calls ADD COLUMN IF NOT EXISTS appointment_id VARCHAR",
