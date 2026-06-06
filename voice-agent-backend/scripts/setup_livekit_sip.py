@@ -57,19 +57,30 @@ async def setup_sip():
         )
         print(f"✅ SIP inbound trunk created: {trunk.sip_trunk_id}")
 
-        # 2) Dispatch rule — individual room per caller (room_prefix lives on Individual).
-        rule = await lk.sip.create_sip_dispatch_rule(
-            api.CreateSIPDispatchRuleRequest(
-                rule=api.SIPDispatchRule(
-                    dispatch_rule_individual=api.SIPDispatchRuleIndividual(
-                        room_prefix="call-",
-                    )
-                ),
-                trunk_ids=[trunk.sip_trunk_id],
-                name="Route all calls",
-            )
+        # 2) Dispatch rule — individual room per caller (room_prefix lives on Individual),
+        #    EXPLICITLY dispatching each inbound `call-*` room to our named agent. The agent
+        #    worker registers with this same name (settings.AGENT_NAME, default
+        #    "clinic-agent"); if the rule names an agent the worker doesn't, no job is
+        #    dispatched and the call rings unanswered. room_config.agents is what makes the
+        #    inbound SIP room request our agent by name.
+        rule_kwargs = dict(
+            rule=api.SIPDispatchRule(
+                dispatch_rule_individual=api.SIPDispatchRuleIndividual(
+                    room_prefix="call-",
+                )
+            ),
+            trunk_ids=[trunk.sip_trunk_id],
+            name="Route all calls",
         )
-        print(f"✅ Dispatch rule created: {rule.sip_dispatch_rule_id}")
+        if settings.AGENT_NAME:
+            rule_kwargs["room_config"] = api.RoomConfiguration(
+                agents=[api.RoomAgentDispatch(agent_name=settings.AGENT_NAME)]
+            )
+        rule = await lk.sip.create_sip_dispatch_rule(
+            api.CreateSIPDispatchRuleRequest(**rule_kwargs)
+        )
+        print(f"✅ Dispatch rule created (dispatches to agent {settings.AGENT_NAME!r}): "
+              f"{rule.sip_dispatch_rule_id}")
 
         sip_host = livekit_sip_host()
         number = settings.TWILIO_PHONE_NUMBER

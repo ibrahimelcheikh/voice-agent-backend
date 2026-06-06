@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     LIVEKIT_URL: str = ""
     LIVEKIT_API_KEY: str = ""
     LIVEKIT_API_SECRET: str = ""
+    # Agent dispatch name. The LiveKit SIP dispatch rule routes inbound `call-*` rooms to a
+    # named agent ("clinic-agent"); the worker MUST register with this same name (explicit
+    # dispatch) or it is never offered the job. Set to "" to use AUTOMATIC dispatch instead
+    # (worker registers with no name and is offered every room) — only do that if the
+    # dispatch rule has NO explicit agent configured.
+    AGENT_NAME: str = "clinic-agent"
     DEEPGRAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
     # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | openai.

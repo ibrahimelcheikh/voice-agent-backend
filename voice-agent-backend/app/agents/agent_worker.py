@@ -70,28 +70,41 @@ def _prewarm_models():
 
 
 async def _request_fnc(req: JobRequest):
-    """Auto-accept inbound SIP call rooms (prefixed `call-`); reject anything else.
+    """ALWAYS accept the job. Logged BEFORE any tenant logic so the worker log shows every
+    job the worker is offered.
 
-    This is the same auto-accept behavior the worker had before the multi-tenant refactor —
-    it does NOT look at tenant/metadata; the tenant is resolved later, at agent start, from
-    the dialed number. The log line below fires for EVERY job request the worker is offered,
-    so if an inbound call produces no '◀ JOB REQUEST' line, no room was created for it
-    (the SIP trunk rejected the call) — the problem is upstream, not here."""
+    The tenant is NOT carried in job metadata — it is resolved later, at agent start, from
+    the DIALED number (see clinic_agent.entrypoint). So this handler must never decline based
+    on tenant/metadata. With explicit dispatch (agent_name set) the worker is only offered
+    jobs the dispatch rule routed to it (inbound `call-*` SIP rooms), so accepting them all
+    is correct. If you see NO '◀ JOB REQUEST' line on an inbound call, the dispatch rule is
+    not routing the room to this agent_name (name mismatch) or no room was created — the
+    problem is upstream of this handler."""
     room_name = (req.room.name if req.room else "") or ""
-    print(f"[worker] ◀ JOB REQUEST received for room {room_name!r}", flush=True)
-    if room_name.startswith("call-"):
-        print(f"[worker] ✅ accepting job for room {room_name}", flush=True)
-        await req.accept()
-    else:
-        print(f"[worker] rejecting non-call room {room_name!r}", flush=True)
-        await req.reject()
+    print(f"[worker] ◀ JOB REQUEST received for room {room_name!r} — accepting", flush=True)
+    await req.accept()
 
 
 def main():
     if len(sys.argv) == 1:
         sys.argv.append("start")
     _prewarm_models()  # ensure the EOU model is cached before we start taking calls
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, request_fnc=_request_fnc))
+
+    # EXPLICIT dispatch by agent_name (default "clinic-agent") so the worker matches the
+    # LiveKit SIP dispatch rule, which routes inbound `call-*` rooms to that agent name.
+    # An automatic-dispatch worker (no agent_name) is NEVER offered a job for a room whose
+    # dispatch rule names a specific agent — that mismatch is the inbound-dispatch failure.
+    # Set AGENT_NAME="" to fall back to automatic dispatch (only if the rule has no agent).
+    opts = dict(entrypoint_fnc=entrypoint, request_fnc=_request_fnc)
+    if settings.AGENT_NAME:
+        opts["agent_name"] = settings.AGENT_NAME
+        print(f"[worker] registering with agent_name={settings.AGENT_NAME!r} "
+              "(EXPLICIT dispatch — must match the SIP dispatch rule's agent name)",
+              flush=True)
+    else:
+        print("[worker] registering with NO agent_name (AUTOMATIC dispatch — offered every "
+              "room; only correct if the dispatch rule has no explicit agent)", flush=True)
+    cli.run_app(WorkerOptions(**opts))
 
 
 if __name__ == "__main__":
