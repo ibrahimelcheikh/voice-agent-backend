@@ -21,11 +21,12 @@ def _livekit_sip_host() -> str:
     return host.replace(".livekit.cloud", ".sip.livekit.cloud")
 
 
-def _sip_dial_twiml() -> str:
-    """TwiML that dials the call into the LiveKit SIP trunk. LiveKit matches the
-    inbound trunk by the called number, then the dispatch rule drops it into a
-    `call-<random>` room where the Aria agent joins."""
-    sip_uri = f"sip:{settings.TWILIO_PHONE_NUMBER}@{_livekit_sip_host()};transport=tcp"
+def _sip_dial_twiml(called_number: str | None = None) -> str:
+    """TwiML that dials the call into the LiveKit SIP trunk. The DIALED number becomes
+    the SIP user part so LiveKit carries it as the trunk/called number — that is the
+    phone -> tenant routing key the agent reads when it joins the `call-<random>` room."""
+    number = called_number or settings.TWILIO_PHONE_NUMBER
+    sip_uri = f"sip:{number}@{_livekit_sip_host()};transport=tcp"
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Dial>
@@ -34,12 +35,39 @@ def _sip_dial_twiml() -> str:
 </Response>"""
 
 
+def _not_configured_twiml() -> str:
+    """Spoken to a caller who dialed a number that no tenant owns, then hang up."""
+    return ("""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say voice="alice">Thank you for calling. This number is not yet configured. """
+            """Please contact support. Goodbye.</Say>
+    <Hangup/>
+</Response>""")
+
+
 @router.post("/inbound")
 async def handle_inbound_call(request: Request, db: AsyncSession = Depends(get_db)):
-    """Twilio hits this when someone calls the number. We bridge the call into the
-    LiveKit SIP trunk via <Dial><Sip>. The Call record is created by the LiveKit
-    `participant_joined` webhook (see livekit_webhooks.py), so we don't duplicate it."""
-    return Response(content=_sip_dial_twiml(), media_type="application/xml")
+    """Twilio hits this when someone calls one of our numbers.
+
+    PHONE -> TENANT ROUTING: the dialed number (`To`) identifies the tenant. If a tenant
+    owns it, we bridge the call into the LiveKit SIP trunk (the agent loads that tenant's
+    config when it joins the room). If NO tenant matches, we play a generic 'not
+    configured' message and hang up — the call never reaches an agent."""
+    from app.services.tenant_service import resolve_tenant_by_number
+
+    form = await request.form()
+    called = form.get("To") or settings.TWILIO_PHONE_NUMBER
+
+    tenant = await resolve_tenant_by_number(db, called)
+    if not tenant:
+        print(f"[twilio] inbound to {called!r} matches no tenant — playing 'not configured'")
+        return Response(content=_not_configured_twiml(), media_type="application/xml")
+
+    print(f"[twilio] inbound to {called!r} routed to tenant {tenant.id} ({tenant.business_name})")
+    # Use the tenant's own number as the SIP user part so the agent resolves the same
+    # tenant from the SIP join (consistent with how `To` matched it here).
+    return Response(content=_sip_dial_twiml(tenant.twilio_phone_number or called),
+                    media_type="application/xml")
 
 
 def _hangup_twiml() -> str:

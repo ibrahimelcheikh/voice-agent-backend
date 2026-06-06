@@ -15,7 +15,9 @@ Pieces:
   * resolve_outbound_context_for_room(room)  — agent side: which appointment is this call?
   * record_reminder_result_by_sid(...)       — Twilio side: mark no-answer / voicemail / failed
 
-Single-tenant (one clinic) by design — no tenant scoping here yet.
+Multi-tenant: each reminder is scoped to its appointment's tenant. The Call + agent are
+attributed to that tenant, and the reminder context carries tenant_id so the agent only
+ever touches that business's data when the patient confirms/reschedules/cancels.
 """
 import asyncio
 import logging
@@ -101,6 +103,8 @@ def _build_context(appt: Appointment, patient: Patient, doctor: Doctor | None,
         "purpose": "reminder",
         "direction": "outbound",
         "call_id": call.id if call else None,
+        # Tenant the appointment belongs to — scopes the agent's data on the reminder call.
+        "tenant_id": appt.tenant_id,
         "appointment_id": appt.id,
         "patient_name": patient.name if patient else None,
         "phone": patient.phone if patient else None,
@@ -136,18 +140,22 @@ async def place_reminder_call(appointment_id: str) -> dict:
             return {"success": False, "reason": "twilio_not_configured"}
 
         # Claim the appointment immediately (guards against double dialing) and create
-        # the pending outbound Call the agent + Twilio callbacks key off of.
-        outbound_agent = (await db.execute(
-            select(Agent).where(Agent.type == AgentType.outbound, Agent.is_active == True)  # noqa: E712
-        )).scalars().first()
+        # the pending outbound Call the agent + Twilio callbacks key off of. The agent is
+        # picked within the appointment's tenant so the Call is correctly attributed.
+        def _agent_q(agent_type):
+            q = select(Agent).where(Agent.type == agent_type, Agent.is_active == True)  # noqa: E712
+            if appt.tenant_id:
+                q = q.where(Agent.tenant_id == appt.tenant_id)
+            return q
+
+        outbound_agent = (await db.execute(_agent_q(AgentType.outbound))).scalars().first()
         if not outbound_agent:
-            outbound_agent = (await db.execute(
-                select(Agent).where(Agent.type == AgentType.inbound, Agent.is_active == True)  # noqa: E712
-            )).scalars().first()
+            outbound_agent = (await db.execute(_agent_q(AgentType.inbound))).scalars().first()
 
         appt.reminder_sent_at = datetime.utcnow()
         appt.reminder_outcome = ReminderOutcome.calling.value
         call = Call(
+            tenant_id=appt.tenant_id,
             agent_id=outbound_agent.id if outbound_agent else None,
             appointment_id=appt.id,
             purpose="reminder",

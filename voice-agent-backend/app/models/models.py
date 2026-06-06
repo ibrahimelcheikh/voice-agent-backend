@@ -7,6 +7,24 @@ import enum
 
 def gen_uuid(): return str(uuid.uuid4())
 
+
+class Niche(str, enum.Enum):
+    """Vertical a tenant operates in. Drives niche-specific config/behavior later;
+    for now all niches share the existing appointment functions."""
+    clinic = "clinic"
+    dental = "dental"
+    real_estate = "real_estate"
+    restaurant = "restaurant"
+    spa = "spa"
+
+
+class UserRole(str, enum.Enum):
+    """Dashboard role of a staff member within their tenant."""
+    owner = "owner"
+    manager = "manager"
+    staff = "staff"
+
+
 class AgentType(str, enum.Enum):
     inbound = "inbound"
     outbound = "outbound"
@@ -50,9 +68,40 @@ class CampaignStatus(str, enum.Enum):
     paused = "paused"
     completed = "completed"
 
+class Tenant(Base):
+    """A single business served by the platform. The inbound Twilio number is the
+    routing key: an incoming call's destination number is matched to exactly one
+    tenant, whose config + data scope the whole call. Every domain table carries a
+    tenant_id so no business can ever see another's data."""
+    __tablename__ = "tenants"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    business_name = Column(String, nullable=False)
+    niche = Column(SAEnum(Niche), nullable=False, default=Niche.clinic)
+    # The dialed Twilio number that routes inbound calls to this tenant. Unique — it is
+    # the single source of truth for phone -> tenant resolution.
+    twilio_phone_number = Column(String, unique=True, nullable=True)
+    default_language = Column(String, default="en")          # en / ar
+    supported_languages = Column(JSON, default=lambda: ["en"])
+    timezone = Column(String, default="Asia/Beirut")
+    # First line the agent speaks on an inbound call for this tenant.
+    greeting_message = Column(Text, nullable=True)
+    # FAQ knowledge the agent may state: hours, services, pricing, locations, policies.
+    # Free-form JSON so each niche can shape it without a schema change.
+    knowledge_base = Column(JSON, default=dict)
+    # Niche-specific settings / business rules (booking windows, deposit policy, etc.).
+    config = Column(JSON, default=dict)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
 class User(Base):
     __tablename__ = "users"
     id = Column(String, primary_key=True, default=gen_uuid)
+    # Staff member of a tenant (owner/manager/staff) for the dashboard. Nullable so a
+    # platform-level superuser can exist without a tenant.
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    role = Column(SAEnum(UserRole), default=UserRole.owner)
     name = Column(String, nullable=False)
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
@@ -62,6 +111,7 @@ class User(Base):
 class BehaviorConfig(Base):
     __tablename__ = "behavior_configs"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     name = Column(String, nullable=False)
     version = Column(Integer, default=1)
     system_prompt = Column(Text)
@@ -78,6 +128,7 @@ class BehaviorConfig(Base):
 class Agent(Base):
     __tablename__ = "agents"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     name = Column(String, nullable=False)
     type = Column(SAEnum(AgentType), nullable=False)
     language = Column(String, default="en")
@@ -97,6 +148,7 @@ class Agent(Base):
 class Campaign(Base):
     __tablename__ = "campaigns"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     name = Column(String, nullable=False)
     agent_id = Column(String, ForeignKey("agents.id"))
     status = Column(SAEnum(CampaignStatus), default=CampaignStatus.draft)
@@ -116,6 +168,7 @@ class Campaign(Base):
 class Call(Base):
     __tablename__ = "calls"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     agent_id = Column(String, ForeignKey("agents.id"), nullable=True)
     campaign_id = Column(String, ForeignKey("campaigns.id"), nullable=True)
     # Set for outbound reminder calls so a placed call can be tied back to the
@@ -146,6 +199,7 @@ class Call(Base):
 class WhatsAppConversation(Base):
     __tablename__ = "whatsapp_conversations"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     agent_id = Column(String, ForeignKey("agents.id"))
     contact_number = Column(String, nullable=False)
     contact_name = Column(String, nullable=True)
@@ -180,6 +234,7 @@ class AppointmentStatus(str, enum.Enum):
 class Clinic(Base):
     __tablename__ = "clinics"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     name = Column(String, nullable=False)
     address = Column(String, nullable=True)
     phone = Column(String, nullable=True)
@@ -191,6 +246,7 @@ class Clinic(Base):
 class Doctor(Base):
     __tablename__ = "doctors"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
     name = Column(String, nullable=False)
     specialty = Column(String, nullable=False)
@@ -204,6 +260,7 @@ class Doctor(Base):
 class Service(Base):
     __tablename__ = "services"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
     name = Column(String, nullable=False)
     duration_minutes = Column(Integer, default=30)
@@ -216,6 +273,7 @@ class Service(Base):
 class Patient(Base):
     __tablename__ = "patients"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
@@ -230,6 +288,7 @@ class Patient(Base):
 class Appointment(Base):
     __tablename__ = "appointments"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
     patient_id = Column(String, ForeignKey("patients.id"), nullable=True)
     doctor_id = Column(String, ForeignKey("doctors.id"), nullable=True)
@@ -253,6 +312,7 @@ class Appointment(Base):
 class InsuranceProvider(Base):
     __tablename__ = "insurance_providers"
     id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     clinic_id = Column(String, ForeignKey("clinics.id"), nullable=True)
     name = Column(String, nullable=False)
     accepted = Column(Boolean, default=True)

@@ -214,11 +214,14 @@ class GuardrailBrain:
 
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
                  max_unclear: int = 5, seed_entities: dict | None = None,
-                 pending_intent: str | None = None):
+                 pending_intent: str | None = None, tenant_id: str | None = None):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
         self._today = today
+        # Tenant whose data this call operates on. Passed into every clinic function so
+        # the agent can only ever read/write THIS business's data — no cross-tenant leak.
+        self._tenant_id = tenant_id
         # Human-readable today (with weekday) so the classifier can compute "next Monday".
         try:
             self._today_human = date.fromisoformat(today).strftime("%A, %B %d, %Y")
@@ -386,6 +389,8 @@ class GuardrailBrain:
         data = {}
         if func:
             kwargs = {k: self.entities.get(k) for k in _FUNCTION_ARGS.get(intent, [])}
+            # Scope every data function to this call's tenant (anti-cross-tenant guard).
+            kwargs["tenant_id"] = self._tenant_id
             tf = time.perf_counter()
             try:
                 data = await func(**kwargs)

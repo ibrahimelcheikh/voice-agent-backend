@@ -381,15 +381,17 @@ def _make_agent_class():
 
     class ClinicAgent(Agent):
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
-                     seed_entities=None, pending_intent=None):
+                     seed_entities=None, pending_intent=None, tenant_id=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
             # confirms the right appointment and reschedule/cancel target it directly.
+            # tenant_id scopes every data function to this caller's business.
             self._brain = GuardrailBrain(openai_api_key=settings.OPENAI_API_KEY,
                                          today=date.today().isoformat(),
                                          seed_entities=seed_entities,
-                                         pending_intent=pending_intent)
+                                         pending_intent=pending_intent,
+                                         tenant_id=tenant_id)
             self._on_state = on_state
             self._on_end = on_end
             self._greeting = greeting or GREETING
@@ -448,9 +450,13 @@ def _make_agent_class():
 
 
 async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
-                 call_context=None):
+                 call_context=None, tenant_id=None):
     """Build the session + guarded agent, start it on the (already-connected) room,
     and run until the call ends (caller hangs up, agent ends it, or max duration).
+
+    `behavior_config` is the resolved TENANT config (greeting_message, system_prompt,
+    voice_id, max_call_duration) for the business the dialed number belongs to.
+    `tenant_id` scopes all of the agent's data lookups to that business.
 
     `call_context` is set for OUTBOUND reminder calls: it carries the appointment data
     so the agent opens with the reminder script (not the inbound greeting) and the
@@ -458,6 +464,9 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     from livekit.agents import RoomInputOptions
 
     reminder = bool(call_context and call_context.get("purpose") == "reminder")
+    # Reminder calls know their tenant from the appointment; prefer that.
+    if reminder and call_context.get("tenant_id"):
+        tenant_id = call_context["tenant_id"]
 
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
     state = {"language": "en", "entities": {}}
@@ -488,13 +497,14 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
         _log(f"outbound reminder call for appointment {call_context.get('appointment_id')}")
     else:
         instructions = (behavior_config or {}).get("system_prompt") or DEFAULT_SYSTEM_PROMPT
-        greeting = GREETING
+        # Greet using THIS tenant's greeting_message (falls back to the generic constant).
+        greeting = (behavior_config or {}).get("greeting_message") or GREETING
         seed_entities = None
         pending_intent = None
 
     agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end,
                                 greeting=greeting, seed_entities=seed_entities,
-                                pending_intent=pending_intent)
+                                pending_intent=pending_intent, tenant_id=tenant_id)
 
     room.on("disconnected", lambda *_a: done.set())
 
@@ -546,7 +556,11 @@ async def entrypoint(ctx):
         return
 
     print(f"[worker] connected to room {room_name} as {AGENT_IDENTITY}")
-    agent_row, behavior_config = await _load_behavior()
+
+    # PHONE -> TENANT ROUTING: resolve the tenant from the dialed number on the SIP join
+    # and load that tenant's config (greeting, system prompt, voice). Falls back to the
+    # default tenant when the number can't be read (best-effort SIP attributes).
+    tenant_id, behavior_config = await _resolve_tenant(ctx.room)
 
     # Is this room one of our outbound reminder calls? If so we already have a Call
     # record (created when the call was placed) and the appointment context; otherwise
@@ -560,13 +574,14 @@ async def entrypoint(ctx):
 
     if call_context:
         call_id = call_context.get("call_id")
+        tenant_id = call_context.get("tenant_id") or tenant_id
         print(f"[worker] room {room_name} is an outbound reminder for appointment "
-              f"{call_context.get('appointment_id')}")
+              f"{call_context.get('appointment_id')} (tenant {tenant_id})")
     else:
-        call_id = await _create_call_record(agent_row, room_name, None)
+        call_id = await _create_call_record(tenant_id, behavior_config, room_name, None)
 
     await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True,
-                 call_context=call_context)
+                 call_context=call_context, tenant_id=tenant_id)
 
 
 # ── Entry point 2: in-process (room watcher / LiveKit webhook) ────────────────
@@ -587,6 +602,10 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
         room = rtc.Room()
         await room.connect(settings.LIVEKIT_URL, generate_agent_token(room_name))
         print(f"[agent] connected to room {room_name} as {AGENT_IDENTITY}")
+        # Phone -> tenant routing: resolve the tenant from the dialed number; the passed-in
+        # behavior_config (if any) overrides the resolved tenant config for manual use.
+        tenant_id, resolved_config = await _resolve_tenant(room)
+        behavior_config = behavior_config or resolved_config
         # Resolve outbound-reminder context (no-op for inbound calls).
         call_context = None
         try:
@@ -594,10 +613,11 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
             call_context = await resolve_outbound_context_for_room(room)
             if call_context:
                 call_id = call_context.get("call_id") or call_id
+                tenant_id = call_context.get("tenant_id") or tenant_id
         except Exception as e:
             print(f"[agent] outbound context resolve failed: {type(e).__name__}: {e}")
         await _serve(room, behavior_config or {}, call_id, datetime.utcnow(),
-                     is_worker=False, call_context=call_context)
+                     is_worker=False, call_context=call_context, tenant_id=tenant_id)
     except Exception as e:
         print(f"[agent] error in room {room_name}: {type(e).__name__}: {e}")
     finally:
@@ -606,41 +626,41 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
 
 # ── Shared DB helpers ─────────────────────────────────────────────────────────
 
-async def _load_behavior():
-    """Active inbound agent + its behavior lock config (best effort)."""
+async def _resolve_tenant(room):
+    """Phone -> tenant resolution for a joined `call-*` room. Returns (tenant_id, config)
+    where config is the tenant's agent config (greeting, system_prompt, voice_id,
+    max_call_duration). Reads the dialed number off the SIP join; falls back to the
+    default tenant when it can't be read so the original clinic keeps working. Never
+    raises — returns (None, {}) on failure."""
     try:
-        from sqlalchemy import select
         from app.db.database import AsyncSessionLocal
-        from app.models.models import Agent, BehaviorConfig
+        from app.services.tenant_service import tenant_context_for_room
         async with AsyncSessionLocal() as db:
-            agent = (await db.execute(
-                select(Agent).where(Agent.type == "inbound", Agent.is_active == True)  # noqa: E712
-            )).scalars().first()
-            if agent and agent.behavior_config_id:
-                cfg = (await db.execute(
-                    select(BehaviorConfig).where(BehaviorConfig.id == agent.behavior_config_id)
-                )).scalars().first()
-                if cfg:
-                    return agent, {"system_prompt": cfg.system_prompt,
-                                   "voice_id": agent.voice_id,
-                                   "max_call_duration": cfg.max_call_duration}
-            return agent, {}
+            resolved = await tenant_context_for_room(db, room)
+        if resolved:
+            tenant_id, config = resolved
+            _log(f"tenant resolved: {config.get('business_name')} ({tenant_id})")
+            return tenant_id, config
+        _log("no tenant resolved for room; running with defaults")
+        return None, {}
     except Exception as e:
-        print(f"[agent] behavior load failed: {type(e).__name__}: {e}")
+        print(f"[agent] tenant resolve failed: {type(e).__name__}: {e}")
         return None, {}
 
 
-async def _create_call_record(agent, room_name, caller):
+async def _create_call_record(tenant_id, config, room_name, caller):
     try:
         from app.db.database import AsyncSessionLocal
         from app.models.models import Call, CallDirection, CallOutcome
         async with AsyncSessionLocal() as db:
             call = Call(
-                agent_id=agent.id if agent else None,
+                tenant_id=tenant_id,
+                agent_id=(config or {}).get("agent_id"),
                 livekit_room=room_name,
                 direction=CallDirection.inbound,
                 caller_number=caller or "sip-caller",
-                called_number=settings.TWILIO_PHONE_NUMBER,
+                # The dialed (tenant) number — falls back to the configured default.
+                called_number=(config or {}).get("twilio_phone_number") or settings.TWILIO_PHONE_NUMBER,
                 outcome=CallOutcome.in_progress,
                 started_at=datetime.utcnow(),
             )

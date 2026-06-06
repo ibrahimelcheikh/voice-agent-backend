@@ -8,6 +8,12 @@ natural-language formatter of this data — it must never invent any of it.
 
 Each function returns a plain dict. A truthy/empty result lets the guardrail
 decide what the LLM is allowed to say (real data vs. "I'll connect you to staff").
+
+MULTI-TENANT: every function takes a `tenant_id` and scopes EVERY query to it, so a
+call for one business can never read or write another business's doctors, services,
+patients, appointments, or insurance. The guardrail passes the tenant_id resolved from
+the dialed phone number into each call. When tenant_id is None (legacy/edge), queries
+are unscoped — but the live agent always supplies one.
 """
 from datetime import datetime, date, timedelta
 
@@ -20,6 +26,14 @@ from app.models.models import (
 )
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _scope(query, model, tenant_id):
+    """Add a tenant filter to a query when a tenant_id is supplied. Centralizes the
+    multi-tenant guard so no function can forget it."""
+    if tenant_id:
+        return query.where(model.tenant_id == tenant_id)
+    return query
 
 
 def _weekday_key(date_str: str) -> str | None:
@@ -37,15 +51,16 @@ def _dollars(cents) -> str:
         return "$0.00"
 
 
-async def _clinic(db) -> Clinic | None:
-    return (await db.execute(select(Clinic))).scalars().first()
+async def _clinic(db, tenant_id=None) -> Clinic | None:
+    return (await db.execute(_scope(select(Clinic), Clinic, tenant_id))).scalars().first()
 
 
-async def _match_doctor(db, doctor: str, clinic_id=None):
+async def _match_doctor(db, doctor: str, tenant_id=None, clinic_id=None):
     """Resolve a spoken doctor reference to a real Doctor row.
 
     Matches on name OR specialty (callers say "Dr. Haddad" or "the dentist").
     Returns None when nothing matches — the agent must not guess a name.
+    Scoped to the tenant so only this business's doctors are ever matched.
     """
     if not doctor:
         return None
@@ -53,7 +68,7 @@ async def _match_doctor(db, doctor: str, clinic_id=None):
     for stop in ("dr.", "dr ", "doctor ", "the "):
         needle = needle.replace(stop, "")
     needle = needle.strip()
-    q = select(Doctor).where(Doctor.is_active == True)  # noqa: E712
+    q = _scope(select(Doctor).where(Doctor.is_active == True), Doctor, tenant_id)  # noqa: E712
     if clinic_id:
         q = q.where(Doctor.clinic_id == clinic_id)
     doctors = (await db.execute(q)).scalars().all()
@@ -66,29 +81,31 @@ async def _match_doctor(db, doctor: str, clinic_id=None):
 # ── 1. Book ──────────────────────────────────────────────────────────────────
 
 async def book_appointment(patient_name=None, phone=None, doctor=None, date=None,
-                           time=None, reason=None) -> dict:
+                           time=None, reason=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        clinic = await _clinic(db)
+        clinic = await _clinic(db, tenant_id)
         if not phone or not patient_name or not date or not time:
             return {"success": False, "missing": [
                 k for k, v in {"patient_name": patient_name, "phone": phone,
                                "date": date, "time": time}.items() if not v]}
 
-        doc = await _match_doctor(db, doctor, clinic.id if clinic else None)
+        doc = await _match_doctor(db, doctor, tenant_id, clinic.id if clinic else None)
         if doctor and not doc:
             return {"success": False, "reason": "doctor_not_found", "requested_doctor": doctor}
 
-        # Find or create the patient by phone.
+        # Find or create the patient by phone — scoped to the tenant so the same number
+        # at two different businesses stays two distinct patients.
         patient = (await db.execute(
-            select(Patient).where(Patient.phone == phone)
+            _scope(select(Patient).where(Patient.phone == phone), Patient, tenant_id)
         )).scalars().first()
         if not patient:
-            patient = Patient(clinic_id=clinic.id if clinic else None,
+            patient = Patient(tenant_id=tenant_id, clinic_id=clinic.id if clinic else None,
                               name=patient_name, phone=phone)
             db.add(patient)
             await db.flush()
 
         appt = Appointment(
+            tenant_id=tenant_id,
             clinic_id=clinic.id if clinic else None,
             patient_id=patient.id,
             doctor_id=doc.id if doc else None,
@@ -113,15 +130,17 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, date=None
 
 # ── 2. Cancel ────────────────────────────────────────────────────────────────
 
-async def cancel_appointment(phone=None, appointment_id=None) -> dict:
+async def cancel_appointment(phone=None, appointment_id=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        q = select(Appointment).where(
+        q = _scope(select(Appointment).where(
             Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
-        )
+        ), Appointment, tenant_id)
         if appointment_id:
             q = q.where(Appointment.id == appointment_id)
         elif phone:
-            patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+            patient = (await db.execute(
+                _scope(select(Patient).where(Patient.phone == phone), Patient, tenant_id)
+            )).scalars().first()
             if not patient:
                 return {"success": False, "reason": "not_found"}
             q = q.where(Appointment.patient_id == patient.id).order_by(Appointment.date)
@@ -141,17 +160,19 @@ async def cancel_appointment(phone=None, appointment_id=None) -> dict:
 # ── 3. Reschedule ────────────────────────────────────────────────────────────
 
 async def reschedule_appointment(phone=None, new_date=None, new_time=None,
-                                 appointment_id=None) -> dict:
+                                 appointment_id=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
         if not new_date or not new_time:
             return {"success": False, "reason": "need_new_date_time"}
-        q = select(Appointment).where(
+        q = _scope(select(Appointment).where(
             Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
-        )
+        ), Appointment, tenant_id)
         if appointment_id:
             q = q.where(Appointment.id == appointment_id)
         elif phone:
-            patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+            patient = (await db.execute(
+                _scope(select(Patient).where(Patient.phone == phone), Patient, tenant_id)
+            )).scalars().first()
             if not patient:
                 return {"success": False, "reason": "not_found"}
             q = q.where(Appointment.patient_id == patient.id).order_by(Appointment.date)
@@ -174,18 +195,20 @@ async def reschedule_appointment(phone=None, new_date=None, new_time=None,
 
 # ── 3b. Confirm ──────────────────────────────────────────────────────────────
 
-async def confirm_appointment(phone=None, appointment_id=None) -> dict:
+async def confirm_appointment(phone=None, appointment_id=None, tenant_id=None) -> dict:
     """Mark an appointment confirmed. Used by the outbound reminder agent when the
     patient says they'll keep the appointment. Targets a specific appointment_id when
     known (reminder calls always pass it), else the patient's soonest open appointment."""
     async with AsyncSessionLocal() as db:
-        q = select(Appointment).where(
+        q = _scope(select(Appointment).where(
             Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
-        )
+        ), Appointment, tenant_id)
         if appointment_id:
             q = q.where(Appointment.id == appointment_id)
         elif phone:
-            patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+            patient = (await db.execute(
+                _scope(select(Patient).where(Patient.phone == phone), Patient, tenant_id)
+            )).scalars().first()
             if not patient:
                 return {"success": False, "reason": "not_found"}
             q = q.where(Appointment.patient_id == patient.id).order_by(Appointment.date)
@@ -204,16 +227,18 @@ async def confirm_appointment(phone=None, appointment_id=None) -> dict:
 
 # ── 4. Check ─────────────────────────────────────────────────────────────────
 
-async def check_appointment(phone=None) -> dict:
+async def check_appointment(phone=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
         if not phone:
             return {"success": False, "reason": "need_phone"}
-        patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+        patient = (await db.execute(
+            _scope(select(Patient).where(Patient.phone == phone), Patient, tenant_id)
+        )).scalars().first()
         if not patient:
             return {"success": False, "reason": "not_found"}
         today = date.today().isoformat()
         appts = (await db.execute(
-            select(Appointment)
+            _scope(select(Appointment), Appointment, tenant_id)
             .where(Appointment.patient_id == patient.id,
                    Appointment.date >= today,
                    Appointment.status.notin_([AppointmentStatus.cancelled]))
@@ -235,9 +260,9 @@ async def check_appointment(phone=None) -> dict:
 
 # ── 5. Clinic hours ──────────────────────────────────────────────────────────
 
-async def get_clinic_hours() -> dict:
+async def get_clinic_hours(tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        clinic = await _clinic(db)
+        clinic = await _clinic(db, tenant_id)
         if not clinic:
             return {"success": False}
         return {"success": True, "clinic": clinic.name, "hours": clinic.hours or {},
@@ -246,9 +271,9 @@ async def get_clinic_hours() -> dict:
 
 # ── 6. Clinic location ───────────────────────────────────────────────────────
 
-async def get_clinic_location() -> dict:
+async def get_clinic_location(tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        clinic = await _clinic(db)
+        clinic = await _clinic(db, tenant_id)
         if not clinic:
             return {"success": False}
         return {"success": True, "clinic": clinic.name, "address": clinic.address,
@@ -257,10 +282,12 @@ async def get_clinic_location() -> dict:
 
 # ── 7. Services ──────────────────────────────────────────────────────────────
 
-async def get_services() -> dict:
+async def get_services(tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        clinic = await _clinic(db)
-        services = (await db.execute(select(Service).order_by(Service.name))).scalars().all()
+        clinic = await _clinic(db, tenant_id)
+        services = (await db.execute(
+            _scope(select(Service), Service, tenant_id).order_by(Service.name)
+        )).scalars().all()
         return {"success": True, "clinic": clinic.name if clinic else None,
                 "services": [
                     {"name": s.name, "duration_minutes": s.duration_minutes,
@@ -270,12 +297,14 @@ async def get_services() -> dict:
 
 # ── 8. Doctor availability ───────────────────────────────────────────────────
 
-async def check_doctor_availability(doctor=None, date=None) -> dict:
+async def check_doctor_availability(doctor=None, date=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
-        doc = await _match_doctor(db, doctor or "")
+        doc = await _match_doctor(db, doctor or "", tenant_id)
         if not doc:
             # Offer the roster so the agent can read real names, never invent them.
-            roster = (await db.execute(select(Doctor).where(Doctor.is_active == True))).scalars().all()  # noqa: E712
+            roster = (await db.execute(
+                _scope(select(Doctor).where(Doctor.is_active == True), Doctor, tenant_id)  # noqa: E712
+            )).scalars().all()
             return {"success": False, "reason": "doctor_not_found",
                     "available_doctors": [{"name": d.name, "specialty": d.specialty} for d in roster]}
         result = {"success": True, "doctor": doc.name, "specialty": doc.specialty,
@@ -290,16 +319,19 @@ async def check_doctor_availability(doctor=None, date=None) -> dict:
 
 # ── 9. Insurance ─────────────────────────────────────────────────────────────
 
-async def check_insurance(insurance_provider=None) -> dict:
+async def check_insurance(insurance_provider=None, tenant_id=None) -> dict:
     async with AsyncSessionLocal() as db:
         if not insurance_provider:
             providers = (await db.execute(
-                select(InsuranceProvider).where(InsuranceProvider.accepted == True)  # noqa: E712
+                _scope(select(InsuranceProvider).where(InsuranceProvider.accepted == True),  # noqa: E712
+                       InsuranceProvider, tenant_id)
             )).scalars().all()
             return {"success": True, "listing": True,
                     "accepted_providers": [p.name for p in providers]}
         needle = insurance_provider.lower().strip()
-        providers = (await db.execute(select(InsuranceProvider))).scalars().all()
+        providers = (await db.execute(
+            _scope(select(InsuranceProvider), InsuranceProvider, tenant_id)
+        )).scalars().all()
         for p in providers:
             if needle in p.name.lower() or p.name.lower() in needle:
                 return {"success": True, "provider": p.name, "accepted": p.accepted,

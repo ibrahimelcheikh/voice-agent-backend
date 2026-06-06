@@ -8,10 +8,10 @@ the clinic, 5 doctors, 8 services, 6 insurance providers, 60 patients,
 from sqlalchemy import select, delete
 from app.db.database import AsyncSessionLocal
 from app.models.models import (
-    User, Agent, BehaviorConfig, Campaign, Call,
+    Tenant, User, Agent, BehaviorConfig, Campaign, Call,
     WhatsAppConversation, WhatsAppMessage,
     Clinic, Doctor, Service, Patient, Appointment, InsuranceProvider,
-    AgentType, AgentStatus, CallDirection, CallOutcome, CampaignStatus,
+    Niche, UserRole, AgentType, AgentStatus, CallDirection, CallOutcome, CampaignStatus,
     AppointmentStatus,
 )
 from datetime import datetime, timedelta, date
@@ -25,6 +25,14 @@ def safe_hash(password: str) -> str:
     pw = password.encode("utf-8")[:72]
     return bcrypt.hashpw(pw, bcrypt.gensalt()).decode("utf-8")
 
+
+# Tenant 1 — the original Prime Health clinic migrated into the multi-tenant model.
+# The Twilio number is the routing key (inbound calls to it load this tenant's config).
+TENANT_ID = "tenant-001"
+TENANT_PHONE = "+16575347796"
+TENANT_GREETING = (
+    "Thank you for calling Prime Health Clinic. This is the AI assistant, how may I help you?"
+)
 
 CLINIC_ID = "clinic-001"
 
@@ -106,6 +114,8 @@ async def seed_mock_data():
         # Safe: we only reach here when zero appointments exist, so nothing real is lost.
         await _clear_seed_tables(db)
 
+        _seed_tenant(db)
+        await db.flush()  # tenant must exist before tenant-scoped rows reference it
         _seed_core(db)
         _seed_clinic(db)
         await db.flush()  # ensure clinic/doctors/services/patients exist before appointments
@@ -127,18 +137,46 @@ async def _clear_seed_tables(db):
     for model in (
         Appointment, WhatsAppMessage, WhatsAppConversation, Call, Campaign,
         Patient, Service, Doctor, InsuranceProvider, Clinic,
-        Agent, BehaviorConfig, User,
+        Agent, BehaviorConfig, User, Tenant,
     ):
         await db.execute(delete(model))
     await db.flush()
 
 
+def _seed_tenant(db):
+    """Tenant 1 — the original Prime Health clinic as a tenant. Its Twilio number is the
+    routing key, and its knowledge base mirrors the clinic's hours/services/insurance so
+    the agent has a tenant-scoped FAQ source from day one."""
+    db.add(Tenant(
+        id=TENANT_ID,
+        business_name="Prime Health Clinic",
+        niche=Niche.clinic,
+        twilio_phone_number=TENANT_PHONE,
+        default_language="en",
+        supported_languages=["en", "ar", "fr", "es"],
+        timezone="Asia/Beirut",
+        greeting_message=TENANT_GREETING,
+        knowledge_base={
+            "hours": CLINIC_HOURS,
+            "location": "Hamra Street, Building 12, Beirut, Lebanon",
+            "phone": TENANT_PHONE,
+            "services": [{"name": n, "price": f"${p / 100:.2f}", "duration_minutes": d}
+                         for n, d, p, _ in SERVICES],
+            "insurance_accepted": [n for n, accepted, _ in INSURANCE if accepted],
+            "policies": "Please arrive 10 minutes early. Cancellations require 24h notice.",
+        },
+        config={"booking_window_days": 30, "default_appointment_minutes": 30},
+    ))
+
+
 def _seed_core(db):
-    db.add(User(id="usr-admin-001", name="Ibrahim Admin",
+    db.add(User(id="usr-admin-001", tenant_id=TENANT_ID, role=UserRole.owner,
+                name="Ibrahim Admin",
                 email="admin@primetechai.com", password_hash=safe_hash("demo1234")))
 
     inbound_config = BehaviorConfig(
         id="cfg-inbound-001",
+        tenant_id=TENANT_ID,
         name="Prime Health Clinic — Receptionist (Inbound)",
         version=1,
         system_prompt=CLINIC_SYSTEM_PROMPT,
@@ -161,17 +199,20 @@ def _seed_core(db):
     db.add(inbound_config)
 
     db.add_all([
-        Agent(id="agt-001", name="Clinic Receptionist (Inbound)", type=AgentType.inbound,
+        Agent(id="agt-001", tenant_id=TENANT_ID, name="Clinic Receptionist (Inbound)",
+              type=AgentType.inbound,
               language="en", voice_id="shimmer", status=AgentStatus.active,
               behavior_config_id="cfg-inbound-001", phone_number="+16575347796",
               calls_today=12, total_calls=412, avg_score=91.2),
-        Agent(id="agt-002", name="Clinic WhatsApp Assistant", type=AgentType.whatsapp,
+        Agent(id="agt-002", tenant_id=TENANT_ID, name="Clinic WhatsApp Assistant",
+              type=AgentType.whatsapp,
               language="en", voice_id="nova", status=AgentStatus.active,
               behavior_config_id="cfg-inbound-001",
               calls_today=19, total_calls=688, avg_score=90.4),
     ])
 
-    db.add(Campaign(id="cmp-001", name="Appointment Reminder Calls", agent_id="agt-001",
+    db.add(Campaign(id="cmp-001", tenant_id=TENANT_ID, name="Appointment Reminder Calls",
+                    agent_id="agt-001",
                     status=CampaignStatus.active, total_contacts=80, called_count=52,
                     connected_count=41, voicemail_count=8, failed_count=3,
                     calls_per_hour=12, retry_attempts=2, contacts=[]))
@@ -179,19 +220,20 @@ def _seed_core(db):
 
 def _seed_clinic(db):
     db.add(Clinic(
-        id=CLINIC_ID, name="Prime Health Clinic",
+        id=CLINIC_ID, tenant_id=TENANT_ID, name="Prime Health Clinic",
         address="Hamra Street, Building 12, Beirut, Lebanon",
         phone="+16575347796", hours=CLINIC_HOURS, timezone="Asia/Beirut",
     ))
     for i, (name, specialty, days) in enumerate(DOCTORS):
-        db.add(Doctor(id=f"doc-{i+1:03d}", clinic_id=CLINIC_ID, name=name, specialty=specialty,
+        db.add(Doctor(id=f"doc-{i+1:03d}", tenant_id=TENANT_ID, clinic_id=CLINIC_ID,
+                      name=name, specialty=specialty,
                       available_days=days, available_hours={"start": "09:00", "end": "17:00"}))
     for i, (name, dur, price, desc) in enumerate(SERVICES):
-        db.add(Service(id=f"svc-{i+1:03d}", clinic_id=CLINIC_ID, name=name,
+        db.add(Service(id=f"svc-{i+1:03d}", tenant_id=TENANT_ID, clinic_id=CLINIC_ID, name=name,
                        duration_minutes=dur, price=price, description=desc))
     for i, (name, accepted, notes) in enumerate(INSURANCE):
-        db.add(InsuranceProvider(id=f"ins-{i+1:03d}", clinic_id=CLINIC_ID, name=name,
-                                 accepted=accepted, notes=notes))
+        db.add(InsuranceProvider(id=f"ins-{i+1:03d}", tenant_id=TENANT_ID, clinic_id=CLINIC_ID,
+                                 name=name, accepted=accepted, notes=notes))
 
 
 def _seed_patients(db):
@@ -205,7 +247,7 @@ def _seed_patients(db):
         used.add(phone)
         name = random.choice(NAMES)
         db.add(Patient(
-            id=pid, clinic_id=CLINIC_ID, name=name, phone=phone,
+            id=pid, tenant_id=TENANT_ID, clinic_id=CLINIC_ID, name=name, phone=phone,
             email=f"{name.split()[0].lower()}{random.randint(1, 999)}@example.com",
             date_of_birth=date(random.randint(1955, 2018),
                                random.randint(1, 12), random.randint(1, 28)).isoformat(),
@@ -234,7 +276,7 @@ def _seed_appointments(db, patient_ids):
         hour = random.choice([9, 10, 11, 12, 14, 15, 16, 17])
         minute = random.choice([0, 0, 15, 30])
         db.add(Appointment(
-            id=f"apt-{i+1:03d}", clinic_id=CLINIC_ID,
+            id=f"apt-{i+1:03d}", tenant_id=TENANT_ID, clinic_id=CLINIC_ID,
             patient_id=random.choice(patient_ids),
             doctor_id=random.choice(doctor_ids),
             service_id=random.choice(service_ids),
@@ -299,7 +341,7 @@ def _seed_calls(db):
             outcome = random.choice([CallOutcome.no_answer, CallOutcome.voicemail, CallOutcome.abandoned])
             duration = random.randint(5, 35)
             db.add(Call(
-                agent_id="agt-001", direction=CallDirection.inbound,
+                tenant_id=TENANT_ID, agent_id="agt-001", direction=CallDirection.inbound,
                 twilio_call_sid=f"CA{_uuid32()}",
                 caller_number=_phone(), called_number="+16575347796",
                 language="en", duration_seconds=duration, outcome=outcome,
@@ -314,7 +356,7 @@ def _seed_calls(db):
         timeline = ([0.2, 0.1, -0.5, -0.6] if outcome == CallOutcome.escalated
                     else [round(random.uniform(0.2, 0.5), 2)] + [round(random.uniform(0.5, 0.95), 2) for _ in range(3)])
         db.add(Call(
-            agent_id="agt-001", direction=CallDirection.inbound,
+            tenant_id=TENANT_ID, agent_id="agt-001", direction=CallDirection.inbound,
             twilio_call_sid=f"CA{_uuid32()}",
             caller_number=extracted.get("phone", _phone()), called_number="+16575347796",
             language=random.choice(langs),
@@ -342,7 +384,7 @@ def _seed_calls(db):
 
 def _seed_whatsapp(db):
     conv = WhatsAppConversation(
-        id="wa-001", agent_id="agt-002",
+        id="wa-001", tenant_id=TENANT_ID, agent_id="agt-002",
         contact_number="+14155550188", contact_name="Maria Santos",
         status="active", message_count=6,
         last_message="You're all set for Tuesday at 3pm with Dr. Sarah Haddad. See you then!",

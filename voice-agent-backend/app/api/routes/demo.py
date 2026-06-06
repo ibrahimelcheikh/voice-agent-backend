@@ -65,12 +65,19 @@ async def simulate_call(data: SimulateCall, db: AsyncSession = Depends(get_db)):
         return {"success": False,
                 "error": f"Unknown scenario. Choose one of {list(SCENARIOS)}"}
 
-    customer_turns = SCENARIOS[scenario]
-    transcript_lines, escalated, tools_used = await _run_conversation(customer_turns, db)
+    # Run the simulator against a real tenant so the tool calls hit tenant-scoped data
+    # (defaults to the original clinic).
+    from app.services.tenant_service import resolve_tenant_id
+    tenant_id = await resolve_tenant_id(db, None)
 
-    agent = (await db.execute(
-        select(Agent).where(Agent.type == "inbound")
-    )).scalars().first()
+    customer_turns = SCENARIOS[scenario]
+    transcript_lines, escalated, tools_used = await _run_conversation(
+        customer_turns, db, tenant_id)
+
+    aq = select(Agent).where(Agent.type == "inbound")
+    if tenant_id:
+        aq = aq.where(Agent.tenant_id == tenant_id)
+    agent = (await db.execute(aq)).scalars().first()
 
     transcript = "\n".join(transcript_lines)
     outcome = CallOutcome.escalated if escalated else CallOutcome.resolved
@@ -78,6 +85,7 @@ async def simulate_call(data: SimulateCall, db: AsyncSession = Depends(get_db)):
     started = datetime.utcnow()
 
     call = Call(
+        tenant_id=tenant_id,
         agent_id=agent.id if agent else None,
         direction=CallDirection.inbound,
         caller_number="+14155550142",
@@ -110,9 +118,9 @@ async def simulate_call(data: SimulateCall, db: AsyncSession = Depends(get_db)):
     }}
 
 
-async def _run_conversation(customer_turns, db):
+async def _run_conversation(customer_turns, db, tenant_id=None):
     """Drive the LLM through the scripted customer turns; returns
-    (transcript_lines, escalated, tools_used)."""
+    (transcript_lines, escalated, tools_used). Tool calls are tenant-scoped."""
     transcript, tools_used, escalated = [], [], False
     try:
         from openai import AsyncOpenAI
@@ -144,7 +152,8 @@ async def _run_conversation(customer_turns, db):
                             args = json.loads(tc.function.arguments or "{}")
                         except json.JSONDecodeError:
                             args = {}
-                        result_text, payload = await execute_tool(tc.function.name, args, db)
+                        result_text, payload = await execute_tool(tc.function.name, args, db,
+                                                                  tenant_id=tenant_id)
                         tools_used.append(tc.function.name)
                         if payload.get("escalated"):
                             escalated = True

@@ -12,8 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import (
     auth, agents, calls, behavior, campaigns, whatsapp, twilio_webhooks,
     appointments, patients, clinic_info, demo, livekit_webhooks, reminders,
+    tenants,
 )
-from app.db.database import engine, Base, reset_schema, ensure_columns
+from app.db.database import engine, Base, reset_schema, ensure_columns, backfill_default_tenant
 from app.db.seed import seed_mock_data
 from app.core.config import settings
 import app.models.models  # noqa: F401  (ensure all models are registered on Base)
@@ -69,6 +70,10 @@ async def startup():
     print("Checking if seed needed...")
     await seed_mock_data()
     print("Seed check complete")
+    # Migrate an EXISTING single-clinic DB to the multi-tenant model: create the default
+    # tenant and assign all pre-existing rows to it. No-op on a fresh DB (the seed already
+    # scopes every row) and on an already-migrated DB.
+    await backfill_default_tenant()
     await configure_twilio_webhook()
     start_reminder_scheduler()
 
@@ -156,6 +161,7 @@ async def configure_twilio_webhook():
 
 # Routes
 app.include_router(auth.router, prefix="/auth", tags=["Auth"])
+app.include_router(tenants.router, prefix="/tenants", tags=["Tenants"])
 app.include_router(agents.router, prefix="/agents", tags=["Agents"])
 app.include_router(calls.router, prefix="/calls", tags=["Calls"])
 app.include_router(behavior.router, prefix="/behavior", tags=["Behavior Config"])

@@ -8,6 +8,7 @@ from typing import Optional
 
 from app.db.database import get_db
 from app.models.models import Appointment, Patient, Doctor, Service, Clinic, AppointmentStatus
+from app.services.tenant_service import resolve_tenant_id
 
 router = APIRouter()
 
@@ -29,6 +30,7 @@ class QuickAppointment(BaseModel):
     date: str               # YYYY-MM-DD
     time: str               # HH:MM (24h)
     reason: Optional[str] = None
+    tenant_id: Optional[str] = None   # which business; defaults to the original clinic
 
 
 async def _serialize(db: AsyncSession, a: Appointment) -> dict:
@@ -47,8 +49,12 @@ async def _serialize(db: AsyncSession, a: Appointment) -> dict:
 @router.get("/")
 async def list_appointments(page: int = 1, page_size: int = 20,
                             status: Optional[str] = None,
+                            tenant_id: Optional[str] = None,
                             db: AsyncSession = Depends(get_db)):
+    tid = await resolve_tenant_id(db, tenant_id)
     q = select(Appointment)
+    if tid:
+        q = q.where(Appointment.tenant_id == tid)
     if status:
         q = q.where(Appointment.status == status)
     total = (await db.execute(select(func.count()).select_from(q.subquery()))).scalar() or 0
@@ -61,8 +67,13 @@ async def list_appointments(page: int = 1, page_size: int = 20,
 
 
 @router.get("/by-phone/{phone}")
-async def appointments_by_phone(phone: str, db: AsyncSession = Depends(get_db)):
-    patient = (await db.execute(select(Patient).where(Patient.phone == phone))).scalars().first()
+async def appointments_by_phone(phone: str, tenant_id: Optional[str] = None,
+                                db: AsyncSession = Depends(get_db)):
+    tid = await resolve_tenant_id(db, tenant_id)
+    pq = select(Patient).where(Patient.phone == phone)
+    if tid:
+        pq = pq.where(Patient.tenant_id == tid)
+    patient = (await db.execute(pq)).scalars().first()
     if not patient:
         return {"items": []}
     rows = (await db.execute(
@@ -77,8 +88,8 @@ async def create_appointment(data: CreateAppointment, db: AsyncSession = Depends
     patient = await db.get(Patient, data.patient_id)
     if not patient:
         raise HTTPException(404, "Patient not found")
-    appt = Appointment(clinic_id=patient.clinic_id, created_via="manual",
-                        **data.model_dump())
+    appt = Appointment(tenant_id=patient.tenant_id, clinic_id=patient.clinic_id,
+                       created_via="manual", **data.model_dump())
     db.add(appt)
     await db.commit()
     return {"success": True, "data": await _serialize(db, appt)}
@@ -94,35 +105,45 @@ async def quick_create_appointment(data: QuickAppointment, db: AsyncSession = De
       optional). A clear error is returned if no doctor matches.
     - Service: any service matching the doctor's specialty, else the first service.
     """
-    clinic = (await db.execute(select(Clinic))).scalars().first()
+    # Resolve which business this appointment belongs to (defaults to the original clinic).
+    tid = await resolve_tenant_id(db, data.tenant_id)
+
+    cq = select(Clinic)
+    if tid:
+        cq = cq.where(Clinic.tenant_id == tid)
+    clinic = (await db.execute(cq)).scalars().first()
     clinic_id = clinic.id if clinic else None
 
-    # Patient — find by phone, create on miss.
-    patient = (await db.execute(
-        select(Patient).where(Patient.phone == data.phone)
-    )).scalars().first()
+    # Patient — find by phone (within this tenant), create on miss.
+    pq = select(Patient).where(Patient.phone == data.phone)
+    if tid:
+        pq = pq.where(Patient.tenant_id == tid)
+    patient = (await db.execute(pq)).scalars().first()
     if not patient:
-        patient = Patient(clinic_id=clinic_id, name=data.patient_name, phone=data.phone)
+        patient = Patient(tenant_id=tid, clinic_id=clinic_id,
+                          name=data.patient_name, phone=data.phone)
         db.add(patient)
         await db.flush()
 
     # Doctor — fuzzy match by name (drop a leading 'Dr.'/'Doctor' so 'Karim Nassar' hits
-    # 'Dr. Karim Nassar'). Match name OR specialty so 'dentist' also works.
+    # 'Dr. Karim Nassar'). Match name OR specialty so 'dentist' also works. Tenant-scoped.
     needle = data.doctor_name.strip()
     for stop in ("Dr.", "Dr ", "Doctor ", "dr.", "dr ", "doctor "):
         if needle.lower().startswith(stop.lower()):
             needle = needle[len(stop):].strip()
             break
-    doctor = (await db.execute(
-        select(Doctor).where(
-            Doctor.is_active == True,  # noqa: E712
-            or_(Doctor.name.ilike(f"%{needle}%"), Doctor.specialty.ilike(f"%{needle}%")),
-        )
-    )).scalars().first()
+    dq = select(Doctor).where(
+        Doctor.is_active == True,  # noqa: E712
+        or_(Doctor.name.ilike(f"%{needle}%"), Doctor.specialty.ilike(f"%{needle}%")),
+    )
+    if tid:
+        dq = dq.where(Doctor.tenant_id == tid)
+    doctor = (await db.execute(dq)).scalars().first()
     if not doctor:
-        roster = (await db.execute(
-            select(Doctor).where(Doctor.is_active == True)  # noqa: E712
-        )).scalars().all()
+        rq = select(Doctor).where(Doctor.is_active == True)  # noqa: E712
+        if tid:
+            rq = rq.where(Doctor.tenant_id == tid)
+        roster = (await db.execute(rq)).scalars().all()
         raise HTTPException(422, {
             "error": "doctor_not_found",
             "message": f"No doctor matches '{data.doctor_name}'.",
@@ -132,7 +153,10 @@ async def quick_create_appointment(data: QuickAppointment, db: AsyncSession = De
     # Service — prefer one whose name relates to the doctor's specialty (stem match, so
     # 'Dentist' hits 'Dental Cleaning'), else the first available service. Best-effort; the
     # reminder flow doesn't require a service.
-    services = (await db.execute(select(Service).order_by(Service.name))).scalars().all()
+    sq = select(Service).order_by(Service.name)
+    if tid:
+        sq = sq.where(Service.tenant_id == tid)
+    services = (await db.execute(sq)).scalars().all()
 
     def _stems(text: str) -> set[str]:
         # 4-char stems so 'dentist'/'dental' and 'cardiologist'/'cardiac' relate.
@@ -147,6 +171,7 @@ async def quick_create_appointment(data: QuickAppointment, db: AsyncSession = De
     service = service or (services[0] if services else None)
 
     appt = Appointment(
+        tenant_id=tid,
         clinic_id=clinic_id,
         patient_id=patient.id,
         doctor_id=doctor.id,

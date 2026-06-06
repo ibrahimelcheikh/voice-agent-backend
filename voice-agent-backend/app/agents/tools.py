@@ -72,16 +72,17 @@ _ARGS = {
 }
 
 
-async def execute_tool(name: str, args: dict, db=None):
+async def execute_tool(name: str, args: dict, db=None, tenant_id=None):
     """Run a clinic function by name. Returns (summary_text, data_payload).
 
     `db` is accepted for interface compatibility but unused — each clinic
-    function opens its own session.
+    function opens its own session. `tenant_id` scopes every function to one business.
     """
     func = CLINIC_FUNCTIONS.get(name)
     if not func:
         return f"Unknown tool: {name}", {"error": "unknown_tool"}
     kwargs = {k: (args or {}).get(k) for k in _ARGS.get(name, [])}
+    kwargs["tenant_id"] = tenant_id
     try:
         data = await func(**kwargs)
     except Exception as e:
