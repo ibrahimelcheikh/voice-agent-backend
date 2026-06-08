@@ -473,6 +473,18 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     # The tenant's niche selects which function set + intents the guardrail loads.
     niche = (behavior_config or {}).get("niche") or "clinic"
 
+    # Phase 3a plumbing: read the caller's IVR-selected language (threaded from Twilio via a
+    # SIP header) and LOG it. The agent does NOT branch on it yet — greeting, generation and
+    # TTS stay exactly as today regardless of the value. Absent (a direct-SIP call with no
+    # IVR, or headers not surfaced) -> defaults to 'en', so the current path is unchanged.
+    try:
+        from app.services.tenant_service import sip_selected_language
+        call_language = sip_selected_language(room) or "en"
+    except Exception as e:
+        print(f"[AGENT] could not read selected language: {type(e).__name__}: {e}", flush=True)
+        call_language = "en"
+    print(f"[AGENT] call language = {call_language}", flush=True)
+
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
     state = {"language": "en", "entities": {}}
     end_reason = {"r": None}
