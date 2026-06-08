@@ -144,34 +144,95 @@ async def _find_open_reservation(db, phone, reservation_id, tenant_id):
 
 # ── Menu ──────────────────────────────────────────────────────────────────────
 
-async def menu_lookup(menu_query=None, tenant_id=None) -> dict:
-    """Answer "what do you have / how much is X" from the tenant's REAL menu.
+# Generic "what's on the menu" style queries — these are NOT a specific item/category to
+# match; they ask to browse, so menu_lookup returns the WHOLE available menu for them.
+_GENERIC_MENU_QUERIES = {
+    "menu", "the menu", "your menu", "our menu", "full menu", "whole menu", "everything",
+    "anything", "food", "items", "item", "options", "list", "selection", "dishes", "dish",
+    "meals", "mains", "main", "main dish", "main dishes", "main course", "main courses",
+    "specials", "special", "best seller", "best sellers", "bestseller", "bestsellers",
+    "best selling", "popular", "most popular", "recommendation", "recommendations",
+    "recommend",
+}
+# Substrings that mark a query as a general "show me the menu" request even when phrased
+# in a longer sentence ("what do you have to eat", "what's good here").
+_GENERIC_MENU_SUBSTRINGS = (
+    "menu", "best sell", "bestsell", "what do you have", "what you have", "what have you",
+    "what can i order", "what can i get", "what's good", "whats good", "what is good",
+    "what's available", "whats available", "what is available", "main dish", "main course",
+    "everything", "popular", "recommend", "selection", "options", "to eat", "specials",
+)
 
-    With a query, returns the available items whose name/category/description matches it
-    (so "how much is a latte" returns the latte). Without one, returns the available menu
-    grouped lightly so the agent can read a few highlights. Only available items are ever
-    returned — the agent must never offer something off-menu or unavailable."""
+
+def _is_generic_menu_query(needle: str) -> bool:
+    """True when the query is a general 'show me the menu' request (browse the whole menu)
+    rather than a specific item/category to price. Generic queries return the full menu."""
+    if not needle:
+        return True
+    if needle in _GENERIC_MENU_QUERIES:
+        return True
+    return any(s in needle for s in _GENERIC_MENU_SUBSTRINGS)
+
+
+def _fmt_item(m) -> dict:
+    return {"name": m.name, "price": _dollars(m.price), "price_cents": m.price,
+            "category": m.category, "description": m.description}
+
+
+def _full_menu_payload(items, query=None) -> dict:
+    """The whole available menu (name + price), grouped by category, plus a flat list. Used
+    for generic queries and as the never-empty fallback so the agent can always read what's
+    available instead of saying 'I couldn't find any'."""
+    by_cat: dict = {}
+    for m in items:
+        by_cat.setdefault(m.category or "Other", []).append(m)
+    return {
+        "success": True,
+        "query": query,
+        "found": bool(items),
+        "is_full_menu": True,
+        "categories": sorted(by_cat.keys()),
+        "menu_by_category": {c: [{"name": m.name, "price": _dollars(m.price)} for m in ms]
+                             for c, ms in by_cat.items()},
+        "items": [_fmt_item(m) for m in items],
+    }
+
+
+async def menu_lookup(menu_query=None, tenant_id=None) -> dict:
+    """Answer "what's on the menu / what do you have / how much is X" from the tenant's REAL
+    menu. Only this tenant's AVAILABLE items are ever returned — the agent must never offer
+    something off-menu or unavailable, and never invents a dish or a price.
+
+    Behavior:
+      * A SPECIFIC item/category query ("how much is the shawarma", "falafel") returns the
+        matching available items.
+      * A GENERIC query ("what's on the menu", "best sellers", "main dishes", "what do you
+        have", "everything") — or a specific query that matches nothing — returns the FULL
+        available menu (name + price, grouped by category).
+      * It NEVER returns empty while the tenant has menu items: at minimum it lists what's
+        available, so the agent can always tell the caller what's on offer.
+    """
     async with AsyncSessionLocal() as db:
         items = (await db.execute(
             _scope(select(MenuItem).where(MenuItem.available == True),  # noqa: E712
                    MenuItem, tenant_id).order_by(MenuItem.category, MenuItem.name)
         )).scalars().all()
 
-        def _fmt(m):
-            return {"name": m.name, "price": _dollars(m.price), "price_cents": m.price,
-                    "category": m.category, "description": m.description}
-
-        if menu_query:
+        # Specific item/category lookup only when the caller named something concrete.
+        if menu_query and not _is_generic_menu_query(menu_query.lower().strip()):
             needle = menu_query.lower().strip()
             matched = [m for m in items
                        if needle in (m.name or "").lower()
                        or needle in (m.category or "").lower()
                        or needle in (m.description or "").lower()]
-            return {"success": True, "query": menu_query, "found": bool(matched),
-                    "items": [_fmt(m) for m in matched[:8]]}
-        return {"success": True, "found": bool(items),
-                "categories": sorted({m.category for m in items if m.category}),
-                "items": [_fmt(m) for m in items]}
+            if matched:
+                return {"success": True, "query": menu_query, "found": True,
+                        "matched_specific": True,
+                        "items": [_fmt_item(m) for m in matched[:8]]}
+            # No concrete match — never dead-end with "couldn't find any"; list the real menu.
+
+        # Generic query, no query, or a specific query that matched nothing -> full menu.
+        return _full_menu_payload(items, query=menu_query)
 
 
 def _match_menu_item(items, name):

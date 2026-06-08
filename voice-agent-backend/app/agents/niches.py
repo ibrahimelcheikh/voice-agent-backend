@@ -83,6 +83,12 @@ class NicheSpec:
     assistant_role: str                   # "the AI receptionist for a medical clinic"
     settled_noun: str                     # "appointment" — used in the settled-context rules
     intent_outcome: dict = field(default_factory=dict)   # success intent -> recorded outcome
+    # What counts as a generic FAQ question for THIS niche. Kept niche-specific so a
+    # restaurant doesn't route food/menu/price questions into the knowledge-base FAQ.
+    faq_examples: str = "hours, location, policies, pricing, products"
+    # Extra niche-specific routing guidance appended to the classifier system prompt — e.g.
+    # for a restaurant, "what's on the menu / how much is X" must be menu_lookup, not faq.
+    routing_hint: str = ""
 
     @property
     def intents(self) -> list:
@@ -199,6 +205,19 @@ RESTAURANT_SPEC = NicheSpec(
     classifier_subject="a restaurant phone call (reservations and pickup orders)",
     assistant_role="the AI host for a restaurant",
     settled_noun="reservation or order",
+    # For a restaurant, food/menu questions are NOT FAQ — they read the real menu.
+    faq_examples="opening hours, location, parking, or general policies (NOT food, menu, "
+                 "dishes, or prices — those are menu_lookup)",
+    routing_hint=(
+        "This is a RESTAURANT. Any question about the FOOD or MENU — what's on the menu, "
+        "what they have / serve / offer to eat, what dishes or items are available, "
+        "naming the items, what's good / popular / the best seller, main dishes, or the "
+        "PRICE of a food item (e.g. \"what do you have\", \"what's on your menu\", "
+        "\"name the items\", \"how much is the shawarma\") — MUST be classified as intent "
+        "'menu_lookup', NEVER 'faq'. Put the caller's words in the menu_query entity. "
+        "Use 'take_order' only when the caller is actually placing an order. Reserve 'faq' "
+        "for non-food questions like opening hours, location, parking, or policies."
+    ),
 )
 
 

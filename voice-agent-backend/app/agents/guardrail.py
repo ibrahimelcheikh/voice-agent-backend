@@ -407,9 +407,13 @@ class GuardrailBrain:
             "If the caller signals they are finished — 'that's it', 'that's all', 'no thanks', "
             "'thank you', 'goodbye', 'I'm done' — classify as 'end_call', even right after "
             "completing a request; a sign-off is NEVER a confirmation. Use intent 'faq' for "
-            "general questions (hours, location, policies, pricing, products). "
+            f"general questions ({self._spec.faq_examples}). "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
+        # Niche-specific routing guidance (e.g. restaurant: menu/food/price questions are
+        # menu_lookup, not faq). Empty for niches that need no extra steer.
+        if self._spec.routing_hint:
+            sys += "\n\n" + self._spec.routing_hint
 
         # Give the classifier short-term memory of the dialogue so short replies — "yes",
         # "correct", a bare phone number or time — are interpreted against what the agent
