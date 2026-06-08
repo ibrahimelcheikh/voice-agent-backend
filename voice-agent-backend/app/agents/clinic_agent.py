@@ -251,6 +251,53 @@ def _build_tts(behavior_config: dict):
     return openai.TTS(model="gpt-4o-mini-tts", voice=voice, api_key=settings.OPENAI_API_KEY)
 
 
+# ── Phase 3b: Arabic (MSA) generation + TTS, gated on the selected language ──────────
+# The base system prompt, guardrail, intent classification, entity extraction, and ALL
+# database content stay ENGLISH (one source of truth). This single instruction is appended
+# AFTER the guardrail's per-turn instruction ONLY on the Arabic branch, so the LLM renders
+# just its FINAL SPOKEN reply in Modern Standard Arabic. It never alters facts or the prompt.
+ARABIC_OUTPUT_INSTRUCTION = (
+    "IMPORTANT — SPOKEN LANGUAGE: The caller selected Arabic. Produce your spoken reply ONLY "
+    "in Modern Standard Arabic (الفصحى) — never a regional dialect. Translate the meaning of "
+    "your reply into natural, correct MSA. Render proper nouns and menu/item/doctor names "
+    "naturally within the Arabic sentence (do not force transliteration). Do NOT change any "
+    "fact, number, price, name, date, or time — only the language of the spoken reply changes."
+)
+
+
+def _arabic_greeting(business_name: str | None) -> str:
+    """Short MSA greeting, equivalent in meaning to the English one. The (English) business
+    name is rendered naturally inside the Arabic sentence."""
+    if business_name:
+        return f"مرحباً بكم في {business_name}. أنا المساعد الآلي، كيف يمكنني مساعدتكم اليوم؟"
+    return "مرحباً بكم. أنا المساعد الآلي، كيف يمكنني مساعدتكم اليوم؟"
+
+
+def _build_cartesia_ar_tts():
+    """Per-call Cartesia TTS for Arabic (MSA), or None when Arabic TTS isn't available — in
+    which case the agent safely keeps the English Deepgram path (and English generation).
+
+    sonic-2 does NOT support Arabic, so CARTESIA_AR_MODEL (default sonic-3.5) is used with
+    language='ar'. Cartesia REQUIRES a voice id and we never guess one: if CARTESIA_AR_VOICE
+    is unset (or no key/plugin), this returns None and Arabic callers fall back to English."""
+    if not settings.CARTESIA_API_KEY:
+        _log("Arabic TTS: no CARTESIA_API_KEY — Arabic callers fall back to the English path")
+        return None
+    if not settings.CARTESIA_AR_VOICE:
+        _log("Arabic TTS: CARTESIA_AR_VOICE not set — NOT guessing a voice id; Arabic callers "
+             "fall back to English until a confirmed MSA voice id is configured")
+        return None
+    try:
+        from livekit.plugins import cartesia
+        model = settings.CARTESIA_AR_MODEL or "sonic-3.5"
+        _log(f"Arabic TTS: Cartesia {model} language=ar voice={settings.CARTESIA_AR_VOICE}")
+        return cartesia.TTS(model=model, language="ar", voice=settings.CARTESIA_AR_VOICE,
+                            api_key=settings.CARTESIA_API_KEY)
+    except Exception as e:
+        _log(f"Arabic TTS unavailable ({type(e).__name__}: {e}); Arabic callers fall back to English")
+        return None
+
+
 def _build_turn_detection():
     """Optional end-of-utterance (EOU) model for sharper, faster turn-taking than VAD
     alone. Multilingual model matches the clinic's en/ar/fr/es. Degrades gracefully to
@@ -409,7 +456,8 @@ def _make_agent_class():
     class ClinicAgent(Agent):
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
                      seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
-                     language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None):
+                     language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None,
+                     ar_tts=None, ar_greeting=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
@@ -432,7 +480,13 @@ def _make_agent_class():
             self._languages = languages or ["en"]
             self._dtmf_event = dtmf_event
             self._dtmf_holder = dtmf_holder if dtmf_holder is not None else {}
-            self._call_language = None   # set by _select_language; stored + logged only
+            self._call_language = None   # set by _select_language (Phase 3a)
+            # Phase 3b: Arabic path is gated on BOTH the selected language == "ar" AND an
+            # available Arabic TTS. self._arabic is the single decided flag (set in on_enter)
+            # consumed by tts_node + on_user_turn_completed. None ar_tts -> English path.
+            self._ar_tts = ar_tts
+            self._ar_greeting = ar_greeting
+            self._arabic = False
 
         async def on_enter(self):
             # Brief pause so the agent's audio track is fully published/subscribed
@@ -440,14 +494,24 @@ def _make_agent_class():
             try:
                 await asyncio.sleep(0.3)
                 # Phase 3a: offer the keypad language menu BEFORE the greeting (no-op for
-                # single-language tenants / reminders). Stores + logs the choice; the
-                # greeting and everything after stay exactly as today regardless of value.
+                # single-language tenants / reminders). Stores + logs the chosen language.
                 await self._select_language()
+                # Phase 3b: decide the Arabic branch — gated on the selected language being
+                # "ar" AND an available Arabic TTS. When false, EVERYTHING below is today's
+                # English path byte-for-byte (Deepgram TTS, English greeting/generation).
+                self._arabic = (self._call_language == "ar") and (self._ar_tts is not None)
+                if self._call_language == "ar" and self._ar_tts is None:
+                    _log("[AGENT] Arabic selected but no Arabic TTS configured "
+                         "(CARTESIA_AR_VOICE unset) — using English Deepgram + English generation")
+                _log(f"[AGENT] TTS for this call = "
+                     f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
                 # session.say() with a fixed string is more reliable/instant than
                 # generate_reply() for a known greeting. For outbound reminders this is the
-                # reminder script; for inbound it's the standard greeting.
+                # reminder script; for inbound it's the standard greeting (English, or MSA on
+                # the Arabic branch). tts_node routes the audio to the right engine.
+                greeting = self._ar_greeting if (self._arabic and self._ar_greeting) else self._greeting
                 _log("greeting: speaking")
-                await self.session.say(self._greeting, allow_interruptions=True)
+                await self.session.say(greeting, allow_interruptions=True)
                 _log("greeting: done")
             except Exception as e:
                 _log(f"greeting error: {type(e).__name__}: {e}")
@@ -490,6 +554,35 @@ def _make_agent_class():
                 if self._dtmf_event is None or not self._dtmf_event.is_set():
                     _log(f"[AGENT] no DTMF — defaulting to {primary}")
 
+        async def tts_node(self, text, model_settings):
+            """Per-call TTS routing (Phase 3b). Arabic branch -> Cartesia (MSA); every other
+            call -> the framework default, i.e. the session's Deepgram TTS exactly as today.
+            The English path is completely untouched (self._arabic is False)."""
+            if self._arabic and self._ar_tts is not None:
+                async for frame in self._arabic_tts_node(text, model_settings):
+                    yield frame
+                return
+            async for frame in Agent.default.tts_node(self, text, model_settings):
+                yield frame
+
+        async def _arabic_tts_node(self, text, model_settings):
+            """Synthesize the text stream with the per-call Cartesia Arabic TTS. Mirrors the
+            framework's default streaming loop, but bound to self._ar_tts (Cartesia streams
+            natively, so no StreamAdapter is needed)."""
+            from livekit.agents import utils
+            conn_options = self.session.conn_options.tts_conn_options
+            async with self._ar_tts.stream(conn_options=conn_options) as stream:
+                async def _forward():
+                    async for chunk in text:
+                        stream.push_text(chunk)
+                    stream.end_input()
+                forward_task = asyncio.create_task(_forward())
+                try:
+                    async for ev in stream:
+                        yield ev.frame
+                finally:
+                    await utils.aio.cancel_and_wait(forward_task)
+
         async def on_user_turn_completed(self, turn_ctx, new_message):
             """Guardrail: classify -> fetch real data -> inject a strict instruction
             BEFORE the LLM responds. The LLM may only state what we provide here.
@@ -506,8 +599,13 @@ def _make_agent_class():
                 elapsed = (time.perf_counter() - t0) * 1000
                 if self._on_state:
                     self._on_state(self._brain.snapshot())
-                # Strict per-turn instruction with ONLY the real DB data.
+                # Strict per-turn instruction with ONLY the real DB data (English — unchanged).
                 turn_ctx.add_message(role="system", content=decision["instruction"])
+                # Phase 3b: ONLY on the Arabic branch, append a final output-language directive
+                # so the LLM renders its spoken reply (incl. the goodbye) in MSA. The guardrail
+                # instruction above and all DB data stay English — only the spoken reply changes.
+                if self._arabic:
+                    turn_ctx.add_message(role="system", content=ARABIC_OUTPUT_INSTRUCTION)
                 logger.info("🧠 guardrail decided intent=%s end=%s in %.0fms",
                             decision.get("intent"), decision.get("end"), elapsed)
                 if decision.get("end") and self._on_end:
@@ -562,6 +660,14 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     dtmf_event = None
     dtmf_holder = {"selected": None}
     dtmf_handler = None
+    # Phase 3b: build the per-call Arabic (MSA) Cartesia TTS only when this tenant actually
+    # offers Arabic. None when Arabic isn't offered or isn't configured -> agent stays English.
+    ar_tts = None
+    ar_greeting = None
+    if multi_language and "ar" in languages:
+        ar_tts = _build_cartesia_ar_tts()
+        if ar_tts is not None:
+            ar_greeting = _arabic_greeting((behavior_config or {}).get("business_name"))
     if multi_language:
         primary = languages[0]
         language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
@@ -658,7 +764,8 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                                 greeting=greeting, seed_entities=seed_entities,
                                 pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
                                 language_prompt=language_prompt, languages=languages,
-                                dtmf_event=dtmf_event, dtmf_holder=dtmf_holder)
+                                dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
+                                ar_tts=ar_tts, ar_greeting=ar_greeting)
 
     room.on("disconnected", lambda *_a: done.set())
 

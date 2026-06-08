@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
     CARTESIA_TTS_MODEL: str = "sonic-2"
     CARTESIA_VOICE: str = ""  # optional Cartesia voice id; blank = plugin default
+    # Arabic (MSA) TTS — used ONLY for calls whose selected language is "ar" (Phase 3b).
+    # sonic-2 does NOT support Arabic; Arabic needs sonic-3/sonic-3.5. A valid Arabic voice id
+    # MUST be supplied (Cartesia requires a voice id and we never guess one) — until
+    # CARTESIA_AR_VOICE is set, Arabic callers safely fall back to the English path.
+    CARTESIA_AR_MODEL: str = "sonic-3.5"
+    CARTESIA_AR_VOICE: str = ""  # REQUIRED for Arabic TTS; blank = Arabic falls back to English
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8030
     DEBUG: bool = True
