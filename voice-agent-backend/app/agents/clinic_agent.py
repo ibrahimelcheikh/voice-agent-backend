@@ -298,6 +298,25 @@ def _build_cartesia_ar_tts():
         return None
 
 
+def _build_whisper_ar_stt():
+    """Per-call OpenAI Whisper STT for the Arabic branch (Phase 3b fix). Deepgram
+    language='multi' romanizes Arabic audio into nonsense English (so every turn is
+    intent=unclear); Whisper transcribes Arabic strongly, so the Arabic branch uses
+    whisper-1 with language='ar'. Whisper is non-streaming (chunked) — it is wrapped with
+    the framework's VAD StreamAdapter at use time, which is the plugin's standard handling.
+
+    Uses the already-configured OPENAI_API_KEY (the LLM provider) — no new credential. The
+    OpenAI STT plugin is already imported here for the Whisper fallback in _build_stt, so no
+    new dependency. Returns None on failure (the Arabic call then keeps Deepgram, logged)."""
+    try:
+        from livekit.plugins import openai
+        _log("Arabic STT: OpenAI Whisper-1 (language=ar, VAD-chunked)")
+        return openai.STT(model="whisper-1", language="ar", api_key=settings.OPENAI_API_KEY)
+    except Exception as e:
+        _log(f"Arabic STT unavailable ({type(e).__name__}: {e}); Arabic call keeps Deepgram multi")
+        return None
+
+
 def _build_turn_detection():
     """Optional end-of-utterance (EOU) model for sharper, faster turn-taking than VAD
     alone. Multilingual model matches the clinic's en/ar/fr/es. Degrades gracefully to
@@ -457,7 +476,7 @@ def _make_agent_class():
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
                      seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
                      language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None,
-                     ar_tts=None, ar_greeting=None):
+                     ar_tts=None, ar_greeting=None, ar_stt=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
@@ -486,6 +505,7 @@ def _make_agent_class():
             # consumed by tts_node + on_user_turn_completed. None ar_tts -> English path.
             self._ar_tts = ar_tts
             self._ar_greeting = ar_greeting
+            self._ar_stt = ar_stt   # Phase 3b fix: Whisper STT used on the Arabic branch only
             self._arabic = False
 
         async def on_enter(self):
@@ -505,6 +525,8 @@ def _make_agent_class():
                          "(CARTESIA_AR_VOICE unset) — using English Deepgram + English generation")
                 _log(f"[AGENT] TTS for this call = "
                      f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
+                _log(f"[AGENT] STT for this call = "
+                     f"{'whisper (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
                 # session.say() with a fixed string is more reliable/instant than
                 # generate_reply() for a known greeting. For outbound reminders this is the
                 # reminder script; for inbound it's the standard greeting (English, or MSA on
@@ -553,6 +575,38 @@ def _make_agent_class():
                 # digit was already logged by the handler, so don't double-log it.
                 if self._dtmf_event is None or not self._dtmf_event.is_set():
                     _log(f"[AGENT] no DTMF — defaulting to {primary}")
+
+        async def stt_node(self, audio, model_settings):
+            """Per-call STT routing (Phase 3b fix). Arabic branch -> OpenAI Whisper (strong
+            Arabic, language=ar); every other call -> the framework default, i.e. the session's
+            Deepgram language='multi' STT exactly as today. The English path is completely
+            untouched (self._arabic is False), so Whisper is NEVER used on a non-Arabic call."""
+            if self._arabic and self._ar_stt is not None:
+                async for ev in self._arabic_stt_node(audio, model_settings):
+                    yield ev
+                return
+            async for ev in Agent.default.stt_node(self, audio, model_settings):
+                yield ev
+
+        async def _arabic_stt_node(self, audio, model_settings):
+            """Transcribe the audio stream with the per-call Whisper STT. Whisper is
+            non-streaming, so it is wrapped in the framework's VAD StreamAdapter (the session's
+            silero VAD) — the standard way to drive a chunked STT; we do not force streaming."""
+            from livekit.agents import stt as stt_mod, utils
+            vad = getattr(self.session, "vad", None) or self.vad
+            wrapped = stt_mod.StreamAdapter(stt=self._ar_stt, vad=vad)
+            conn_options = self.session.conn_options.stt_conn_options
+            async with wrapped.stream(conn_options=conn_options) as stream:
+                async def _forward():
+                    async for frame in audio:
+                        stream.push_frame(frame)
+                    stream.end_input()
+                forward_task = asyncio.create_task(_forward())
+                try:
+                    async for ev in stream:
+                        yield ev
+                finally:
+                    await utils.aio.cancel_and_wait(forward_task)
 
         async def tts_node(self, text, model_settings):
             """Per-call TTS routing (Phase 3b). Arabic branch -> Cartesia (MSA); every other
@@ -664,10 +718,14 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     # offers Arabic. None when Arabic isn't offered or isn't configured -> agent stays English.
     ar_tts = None
     ar_greeting = None
+    ar_stt = None
     if multi_language and "ar" in languages:
         ar_tts = _build_cartesia_ar_tts()
         if ar_tts is not None:
             ar_greeting = _arabic_greeting((behavior_config or {}).get("business_name"))
+            # Phase 3b fix: Arabic speech-IN uses Whisper (Deepgram multi romanizes Arabic).
+            # Only built when the Arabic branch is actually active (Cartesia voice present).
+            ar_stt = _build_whisper_ar_stt()
     if multi_language:
         primary = languages[0]
         language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
@@ -765,7 +823,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                                 pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
                                 language_prompt=language_prompt, languages=languages,
                                 dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
-                                ar_tts=ar_tts, ar_greeting=ar_greeting)
+                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt)
 
     room.on("disconnected", lambda *_a: done.set())
 
