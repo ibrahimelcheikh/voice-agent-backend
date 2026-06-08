@@ -527,6 +527,23 @@ def _make_agent_class():
                      f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
                 _log(f"[AGENT] STT for this call = "
                      f"{'whisper (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
+                # Phase 3b fix #2: on the Arabic branch ONLY, switch THIS call's turn detection
+                # from the EOU MultilingualModel to VAD endpointing. The EOU model can't get a
+                # language from the chunked, non-streaming Whisper path ("Turn detector does not
+                # support language None"), so it never fires end-of-turn and Whisper is never
+                # handed the utterance. VAD (Silero) endpointing finalizes utterances on silence
+                # so Whisper transcribes them. Live per-call change on the running session
+                # (update_options -> the active activity), NOT a session rebuild. English calls
+                # never reach this and keep the EOU turn detector untouched.
+                if self._arabic:
+                    try:
+                        self.session.update_options(turn_detection="vad")
+                        _log("[AGENT] Arabic branch: turn detection = VAD endpointing "
+                             "(EOU model OFF for this call) — Silero min_silence 0.3s, "
+                             "endpointing min 0.8s / max 4.0s")
+                    except Exception as e:
+                        _log(f"[AGENT] could not switch Arabic turn detection to VAD: "
+                             f"{type(e).__name__}: {e}")
                 # session.say() with a fixed string is more reliable/instant than
                 # generate_reply() for a known greeting. For outbound reminders this is the
                 # reminder script; for inbound it's the standard greeting (English, or MSA on
