@@ -100,6 +100,27 @@ _INCOMPLETE_TASK = {
                      "detail(s) before confirming."),
 }
 
+
+def _full_menu_task(data: dict) -> str:
+    """Build the per-turn task for a full-menu readback so the agent reads a few real items
+    (name + price) in ONE concise reply and offers the rest — never trailing off after one
+    item. Uses the actual items returned by menu_lookup (already tenant-scoped + available)."""
+    items = [i for i in (data.get("items") or []) if isinstance(i, dict) and i.get("name")]
+    head = items[:3]
+    sample = ", ".join(f"{i['name']} {i.get('price', '')}".strip() for i in head)
+    remaining = max(0, len(items) - len(head))
+    rest = (f", then offer the remaining {remaining} (e.g. \"want to hear the rest?\")"
+            if remaining else "")
+    return (
+        "The caller asked what's on the menu. Read the menu out loud in ONE short, natural "
+        "spoken sentence: name the first 2-3 items WITH their prices"
+        f"{rest}. "
+        f"Say it like: \"We have {sample} — want to hear the rest?\". "
+        "Use ONLY the real item names and prices from the data below; do NOT invent items; "
+        "do NOT trail off after a single item. This one reply may use up to ~25 words to fit "
+        "the 2-3 items and prices."
+    )
+
 # Short affirmations that confirm a pending action. These must NEVER be treated as
 # "unclear" — a caller saying "yes" to "shall I book it?" is completing the booking.
 _AFFIRMATIVE_WORDS = {
@@ -273,6 +294,17 @@ class GuardrailBrain:
                         user_text, self._pending_intent)
             intent = self._pending_intent
 
+        # end_call may ONLY fire on a CLEAR, deterministic closing phrase (_is_closing). The
+        # classifier sometimes mis-tags vague/incomplete fragments — "you can do", "okay",
+        # "I suppose", "go ahead", "yeah" — as end_call and hangs up mid-conversation. If it
+        # returned end_call but the utterance is NOT a clear closer (and wasn't resolved to a
+        # pending action above), do NOT end the call — treat it as continuation ('unclear')
+        # and ask one short clarifying question instead of saying goodbye.
+        if intent == "end_call" and not closing:
+            logger.info("🚫 classifier said end_call on non-closing fragment %r — "
+                        "NOT hanging up; treating as continuation", user_text)
+            intent = "unclear"
+
         logger.info("🧭 intent=%s lang=%s entities=%s pending=%s settled=%s in %.0fms",
                     intent, language, extracted, self._pending_intent, self._settled,
                     (time.perf_counter() - t0) * 1000)
@@ -391,6 +423,11 @@ class GuardrailBrain:
         payload = {"intent": intent, "data": data}
         if isinstance(data, dict) and not data.get("success") and intent in _INCOMPLETE_TASK:
             payload["task"] = _INCOMPLETE_TASK[intent]
+        # Full-menu readback: when menu_lookup returns the whole menu, give the LLM an
+        # explicit, concrete task (the real item names + prices) so it reads 2-3 in ONE
+        # concise sentence and offers the rest — instead of trailing off after one item.
+        elif isinstance(data, dict) and data.get("is_full_menu") and data.get("found"):
+            payload["task"] = _full_menu_task(data)
         return {"instruction": self._wrap(last_assistant, payload),
                 "intent": intent, "data": data, "end": None, "transfer": False}
 
@@ -404,9 +441,14 @@ class GuardrailBrain:
             "'tomorrow', 'this Friday', 'next Monday at 3pm', 'next week' — into absolute "
             "YYYY-MM-DD and 24h HH:MM. NEVER leave a date relative and never expect the caller "
             "to give a calendar date. Detect the spoken language (en/ar/fr/es). "
-            "If the caller signals they are finished — 'that's it', 'that's all', 'no thanks', "
-            "'thank you', 'goodbye', 'I'm done' — classify as 'end_call', even right after "
-            "completing a request; a sign-off is NEVER a confirmation. Use intent 'faq' for "
+            "Only classify 'end_call' for a CLEAR closing phrase — 'goodbye', 'bye', "
+            "'that's all', 'that's it thank you', \"I'm done\", 'nothing else', 'no thanks "
+            "bye' — even right after completing a request; a sign-off is NEVER a confirmation. "
+            "Do NOT classify vague or incomplete fragments as 'end_call': 'you can do', 'you "
+            "can do it', 'okay', 'I suppose', 'go ahead', 'yeah', 'sure', 'hmm', 'right' are "
+            "NOT goodbyes. When the message is ambiguous or incomplete, do NOT end the call — "
+            "classify it as 'unclear' (or the action already in progress) so the conversation "
+            "continues. Use intent 'faq' for "
             f"general questions ({self._spec.faq_examples}). "
             "If the message is ambiguous or you cannot tell what they want, use intent 'unclear'."
         )
