@@ -45,11 +45,6 @@ async def setup_sip():
     )
     try:
         # 1) Inbound SIP trunk — accepts calls to our Twilio number from Twilio's IPs.
-        #    include_headers=SIP_X_HEADERS + headers_to_attributes maps the IVR's custom
-        #    `X-Language` SIP header to a participant attribute (`sip.language`) the agent
-        #    reads (Phase 3a). Harmless when absent (direct-SIP call) — the agent defaults
-        #    to English. To enable this on an EXISTING trunk, run
-        #    scripts/enable_sip_x_headers.py (no need to recreate the trunk).
         trunk = await lk.sip.create_sip_inbound_trunk(
             api.CreateSIPInboundTrunkRequest(
                 trunk=api.SIPInboundTrunkInfo(
@@ -57,8 +52,6 @@ async def setup_sip():
                     numbers=[settings.TWILIO_PHONE_NUMBER],
                     allowed_addresses=TWILIO_SIP_CIDRS,
                     krisp_enabled=True,  # server-side noise cancellation
-                    include_headers=api.SIPHeaderOptions.SIP_X_HEADERS,
-                    headers_to_attributes={"X-Language": "sip.language"},
                 )
             )
         )

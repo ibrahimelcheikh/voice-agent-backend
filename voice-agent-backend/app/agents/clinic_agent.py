@@ -117,6 +117,33 @@ def build_reminder_greeting(ctx: dict) -> str:
         "Would you like to confirm, reschedule, or cancel?"
     )
 
+
+# ── Phase 3a: language selection (English names; Arabic-voiced prompt comes later) ──
+_LANG_NAMES_EN = {"en": "English", "ar": "Arabic", "fr": "French", "es": "Spanish"}
+
+
+def _normalize_languages(raw) -> list[str]:
+    """Tenant's supported language codes, normalized (lowercase 2-letter, de-duped, order
+    preserved). The FIRST entry is the PRIMARY/default language. Always non-empty (falls
+    back to ['en']) so the flow is English-safe even for a misconfigured tenant."""
+    langs: list[str] = []
+    for x in (raw or ["en"]):
+        c = str(x).strip().lower()[:2]
+        if c and c not in langs:
+            langs.append(c)
+    return langs or ["en"]
+
+
+def _build_language_prompt(business_name: str | None, languages: list[str]) -> str:
+    """Short bilingual keypad prompt, e.g. 'Welcome to Golden Fork. For English, press 1.
+    For Arabic, press 2.' Spoken with the current (English) TTS in this phase — an
+    Arabic-voiced prompt comes in 3b. Digit N maps to the Nth supported language."""
+    parts = [f"Welcome to {business_name}." if business_name else "Welcome."]
+    for i, lang in enumerate(languages):
+        parts.append(f"For {_LANG_NAMES_EN.get(lang, lang)}, press {i + 1}.")
+    return " ".join(parts)
+
+
 # Rooms handled in THIS process — guards the webhook and room watcher against a
 # double-join into the same room.
 _active_rooms: set[str] = set()
@@ -381,7 +408,8 @@ def _make_agent_class():
 
     class ClinicAgent(Agent):
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
-                     seed_entities=None, pending_intent=None, tenant_id=None, niche=None):
+                     seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
+                     language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
@@ -397,20 +425,70 @@ def _make_agent_class():
             self._on_state = on_state
             self._on_end = on_end
             self._greeting = greeting or GREETING
+            # Phase 3a language selection (multi-language inbound only). The prompt + a
+            # shared DTMF event/holder are wired up in _serve; absent for single-language
+            # tenants and outbound reminders, in which case selection is skipped entirely.
+            self._language_prompt = language_prompt
+            self._languages = languages or ["en"]
+            self._dtmf_event = dtmf_event
+            self._dtmf_holder = dtmf_holder if dtmf_holder is not None else {}
+            self._call_language = None   # set by _select_language; stored + logged only
 
         async def on_enter(self):
             # Brief pause so the agent's audio track is fully published/subscribed
-            # before we speak — otherwise the first word(s) of the greeting get cut.
-            # session.say() with a fixed string is more reliable/instant than
-            # generate_reply() for a known greeting. For outbound reminders this is the
-            # reminder script; for inbound it's the standard greeting.
+            # before we speak — otherwise the first word(s) get cut.
             try:
                 await asyncio.sleep(0.3)
+                # Phase 3a: offer the keypad language menu BEFORE the greeting (no-op for
+                # single-language tenants / reminders). Stores + logs the choice; the
+                # greeting and everything after stay exactly as today regardless of value.
+                await self._select_language()
+                # session.say() with a fixed string is more reliable/instant than
+                # generate_reply() for a known greeting. For outbound reminders this is the
+                # reminder script; for inbound it's the standard greeting.
                 _log("greeting: speaking")
                 await self.session.say(self._greeting, allow_interruptions=True)
                 _log("greeting: done")
             except Exception as e:
                 _log(f"greeting error: {type(e).__name__}: {e}")
+
+        async def _select_language(self):
+            """Phase 3a — brief bilingual prompt + keypad (DTMF) language capture, run BEFORE
+            the greeting. Stores the chosen code on self._call_language and LOGS it. It NEVER
+            branches behaviour on the value — the greeting / LLM / TTS below are byte-for-byte
+            today's English flow (Arabic generation arrives in 3b).
+
+            Multi-language tenants only; for a single-language tenant (no prompt) it just
+            records the primary language and returns — no keypad step at all. A missed
+            keypress (timeout) or an invalid digit defaults to the PRIMARY (first) language;
+            the call is never blocked or dropped waiting for a key."""
+            languages = self._languages or ["en"]
+            primary = languages[0]
+            if not self._language_prompt or len(languages) < 2:
+                self._call_language = primary
+                return
+            try:
+                _log("language prompt: speaking")
+                await self.session.say(self._language_prompt, allow_interruptions=False)
+            except Exception as e:
+                _log(f"language prompt error: {type(e).__name__}: {e}")
+            # Wait briefly for a keypress. The DTMF handler (registered on the room in
+            # _serve) fills dtmf_holder['selected'] and sets dtmf_event. On timeout we
+            # simply default — never hang.
+            if self._dtmf_event is not None:
+                try:
+                    await asyncio.wait_for(self._dtmf_event.wait(), timeout=6.0)
+                except asyncio.TimeoutError:
+                    pass
+            selected = (self._dtmf_holder or {}).get("selected")
+            if selected:
+                self._call_language = selected   # handler already logged the selection
+            else:
+                self._call_language = primary
+                # A true no-input timeout (event never set) is logged here; an invalid
+                # digit was already logged by the handler, so don't double-log it.
+                if self._dtmf_event is None or not self._dtmf_event.is_set():
+                    _log(f"[AGENT] no DTMF — defaulting to {primary}")
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
             """Guardrail: classify -> fetch real data -> inject a strict instruction
@@ -473,17 +551,58 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     # The tenant's niche selects which function set + intents the guardrail loads.
     niche = (behavior_config or {}).get("niche") or "clinic"
 
-    # Phase 3a plumbing: read the caller's IVR-selected language (threaded from Twilio via a
-    # SIP header) and LOG it. The agent does NOT branch on it yet — greeting, generation and
-    # TTS stay exactly as today regardless of the value. Absent (a direct-SIP call with no
-    # IVR, or headers not surfaced) -> defaults to 'en', so the current path is unchanged.
-    try:
-        from app.services.tenant_service import sip_selected_language
-        call_language = sip_selected_language(room) or "en"
-    except Exception as e:
-        print(f"[AGENT] could not read selected language: {type(e).__name__}: {e}", flush=True)
-        call_language = "en"
-    print(f"[AGENT] call language = {call_language}", flush=True)
+    # ── Phase 3a: language selection over SIP (DTMF) ──────────────────────────────
+    # Multi-language tenants get a brief keypad prompt at call start; the digit is captured
+    # natively via LiveKit's `sip_dtmf_received` event on the SIP leg (no Twilio webhook).
+    # Single-language tenants and outbound reminders skip it entirely — no prompt, no keypad,
+    # zero change to today's flow. The chosen language is only stored + logged in this phase.
+    languages = _normalize_languages((behavior_config or {}).get("supported_languages"))
+    multi_language = (not reminder) and len(languages) >= 2
+    language_prompt = None
+    dtmf_event = None
+    dtmf_holder = {"selected": None}
+    dtmf_handler = None
+    if multi_language:
+        primary = languages[0]
+        language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
+                                                 languages)
+        dtmf_event = asyncio.Event()
+
+        def _on_dtmf(ev, _languages=languages, _primary=primary):
+            """LiveKit rtc.SipDTMF handler: map the keypad digit to a language by position
+            (1 -> languages[0], 2 -> languages[1], …). Valid digit -> store it; invalid digit
+            -> treat as no-input (default to primary). Always resolves the wait so the call
+            proceeds immediately on a keypress."""
+            try:
+                digit = (getattr(ev, "digit", "") or "").strip()
+                if not digit:
+                    code = getattr(ev, "code", None)
+                    digit = str(code) if code is not None else ""
+                idx = int(digit) - 1 if digit.isdigit() else -1
+                if 0 <= idx < len(_languages):
+                    dtmf_holder["selected"] = _languages[idx]
+                    print(f"[AGENT] call language selected via DTMF = {_languages[idx]}",
+                          flush=True)
+                else:
+                    dtmf_holder["selected"] = None
+                    print(f"[AGENT] invalid DTMF digit {digit!r} — defaulting to {_primary}",
+                          flush=True)
+            except Exception as e:
+                dtmf_holder["selected"] = None
+                print(f"[AGENT] DTMF handler error: {type(e).__name__}: {e}", flush=True)
+            finally:
+                dtmf_event.set()
+
+        try:
+            room.on("sip_dtmf_received", _on_dtmf)
+            dtmf_handler = _on_dtmf
+            _log(f"language selection enabled (languages={languages}) — awaiting keypad DTMF")
+        except Exception as e:
+            # No DTMF capability -> don't prompt; the agent defaults to the primary language
+            # and runs the normal flow. Never require a keypress to function.
+            print(f"[AGENT] could not register DTMF handler: {type(e).__name__}: {e}; "
+                  f"defaulting to {primary}", flush=True)
+            language_prompt = None
 
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
     state = {"language": "en", "entities": {}}
@@ -537,7 +656,9 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
 
     agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end,
                                 greeting=greeting, seed_entities=seed_entities,
-                                pending_intent=pending_intent, tenant_id=tenant_id, niche=niche)
+                                pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
+                                language_prompt=language_prompt, languages=languages,
+                                dtmf_event=dtmf_event, dtmf_holder=dtmf_holder)
 
     room.on("disconnected", lambda *_a: done.set())
 
@@ -553,6 +674,11 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
         await session.aclose()
     except Exception:
         pass
+    if dtmf_handler is not None:
+        try:
+            room.off("sip_dtmf_received", dtmf_handler)
+        except Exception:
+            pass
     if not is_worker:
         try:
             await room.disconnect()

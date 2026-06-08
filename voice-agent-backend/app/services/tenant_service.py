@@ -199,32 +199,6 @@ def sip_caller_number(room) -> str | None:
     return None
 
 
-def sip_selected_language(room) -> str | None:
-    """Best-effort: the language the caller chose at the IVR keypress menu, threaded from
-    Twilio as a custom SIP header `X-Language` that LiveKit surfaces as a participant
-    attribute. We check the explicit mapped attribute (`sip.language`) first, then the
-    generic `sip.h.*` header attributes LiveKit exposes when X-headers are enabled.
-
-    Returns None when no language was attached — e.g. a DIRECT-SIP call that bypassed the
-    IVR — in which case the agent defaults to English. This is purely additive plumbing:
-    its absence never changes how the agent behaves."""
-    try:
-        participants = list(getattr(room, "remote_participants", {}).values())
-    except Exception:
-        return None
-    keys = ("sip.language", "sip.h.X-Language", "sip.h.x-language",
-            "sip.h.X-language", "sip.h.x-Language")
-    for p in participants:
-        attrs = getattr(p, "attributes", None) or {}
-        for key in keys:
-            val = attrs.get(key)
-            if val:
-                code = str(val).strip().lower()[:5]
-                if code:
-                    return code
-    return None
-
-
 def log_sip_attributes(room) -> None:
     """Dump the FULL attributes dict of every remote participant so the SIP routing keys
     (sip.trunkPhoneNumber, sip.phoneNumber, sip.ruleID, …) the agent reads are fully
