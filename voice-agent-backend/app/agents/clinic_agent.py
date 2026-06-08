@@ -570,23 +570,24 @@ async def entrypoint(ctx):
     # "JOB RECEIVED" line on an inbound call, the problem is upstream of the agent (the SIP
     # trunk rejected the call / no room was created), not in this entrypoint.
     pre_room = getattr(getattr(ctx, "room", None), "name", None) or "?"
-    print(f"[agent] ▶ JOB RECEIVED for room {pre_room}", flush=True)
+    print(f"[AGENT] ▶ JOB RECEIVED for room {pre_room}", flush=True)
 
     try:
         await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     except Exception as e:
-        print(f"[agent] ❌ connect failed for room {pre_room}: {type(e).__name__}: {e}",
+        print(f"[AGENT] ❌ connect failed for room {pre_room}: {type(e).__name__}: {e}",
               flush=True)
         raise
     room_name = ctx.room.name
-    print(f"[agent] connected to room {room_name} as {AGENT_IDENTITY}", flush=True)
+    print(f"[AGENT] connected to room {room_name} as {AGENT_IDENTITY}", flush=True)
 
     # Double-join guard: if another agent participant is already in this room, bail
     # out so only one agent ever answers a call.
     others = [p for p in ctx.room.remote_participants.values()
               if (getattr(p, "identity", "") or "").startswith(AGENT_IDENTITY_PREFIX)]
     if others:
-        print(f"[worker] agent already in {room_name} ({others[0].identity}); skipping join")
+        print(f"[AGENT] agent already in {room_name} ({others[0].identity}); skipping join",
+              flush=True)
         await ctx.room.disconnect()
         return
 
@@ -670,25 +671,29 @@ async def _resolve_tenant(room):
     try:
         from app.db.database import AsyncSessionLocal
         from app.services.tenant_service import tenant_context_for_room, sip_called_number
+        room_name = getattr(room, "name", "?")
+        print(f"[AGENT] _resolve_tenant start for room {room_name!r}", flush=True)
         dialed = None
         try:
             dialed = sip_called_number(room)
         except Exception:
             dialed = None
+        # tenant_context_for_room dumps every SIP attribute, logs the dialed number, and
+        # emits the loud ⚠️ FALLBACK TO DEFAULT TENANT line when no tenant matches.
         async with AsyncSessionLocal() as db:
             resolved = await tenant_context_for_room(db, room)
         if resolved:
             tenant_id, config = resolved
-            print(f"[agent] resolved tenant: {config.get('business_name')} "
+            print(f"[AGENT] _resolve_tenant -> {config.get('business_name')} "
                   f"({config.get('niche')}) for dialed number {dialed or 'unknown'} "
                   f"[tenant_id={tenant_id}]", flush=True)
             return tenant_id, config
-        print(f"[agent] no tenant resolved for dialed number {dialed or 'unknown'}; "
+        print(f"[AGENT] no tenant resolved for dialed number {dialed or 'unknown'}; "
               "running with defaults", flush=True)
         return None, {}
     except Exception as e:
         # Tenant resolution must NEVER stop the agent from answering — fall back to defaults.
-        print(f"[agent] tenant resolve failed: {type(e).__name__}: {e}; running with defaults",
+        print(f"[AGENT] tenant resolve failed: {type(e).__name__}: {e}; running with defaults",
               flush=True)
         return None, {}
 

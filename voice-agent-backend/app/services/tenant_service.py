@@ -198,18 +198,66 @@ def sip_caller_number(room) -> str | None:
     return None
 
 
+def log_sip_attributes(room) -> None:
+    """Dump the FULL attributes dict of every remote participant so the SIP routing keys
+    (sip.trunkPhoneNumber, sip.phoneNumber, sip.ruleID, …) the agent reads are fully
+    visible in the logs at the [AGENT] hop. Pure logging — never raises."""
+    try:
+        participants = list(getattr(room, "remote_participants", {}).values())
+    except Exception as e:
+        print(f"[AGENT] could not read room participants: {type(e).__name__}: {e}", flush=True)
+        return
+    if not participants:
+        print("[AGENT] no remote participants on the room yet (SIP join not visible)", flush=True)
+        return
+    for p in participants:
+        identity = getattr(p, "identity", "?")
+        kind = getattr(p, "kind", "?")
+        attrs = dict(getattr(p, "attributes", None) or {})
+        print(f"[AGENT] participant identity={identity!r} kind={kind} "
+              f"SIP attributes={attrs!r}", flush=True)
+
+
 async def tenant_context_for_room(db, room) -> tuple[str, dict] | None:
     """Resolve (tenant_id, config) for a freshly-joined inbound `call-*` room.
 
     Reads the dialed number off the SIP join and matches it to a tenant. If the number
     can't be read (SIP attributes are best-effort across providers), falls back to the
     default tenant so the original single-tenant clinic keeps working. Returns None only
-    when there are no tenants at all (nothing to serve)."""
+    when there are no tenants at all (nothing to serve).
+
+    INSTRUMENTED (Phase 0): dumps every SIP attribute, logs the dialed number (or
+    'could not read'), and emits a LOUD ⚠️ FALLBACK TO DEFAULT TENANT line whenever the
+    dialed number matched no tenant — so the default-tenant fallback is never silent.
+    Behavior is unchanged: the same tenant is resolved exactly as before."""
+    room_name = getattr(room, "name", "?")
+    print(f"[AGENT] resolving tenant for room {room_name!r}", flush=True)
+    log_sip_attributes(room)
+
     number = sip_called_number(room)
+    if number:
+        print(f"[AGENT] dialed (called) number read off SIP join: {number!r}", flush=True)
+    else:
+        print("[AGENT] dialed (called) number: COULD NOT READ from SIP attributes", flush=True)
+
     tenant = await resolve_tenant_by_number(db, number) if number else None
-    if not tenant:
+    if tenant:
+        print(f"[AGENT] dialed number {number!r} matched tenant {tenant.id} "
+              f"({tenant.business_name}) — deterministic routing", flush=True)
+    else:
         tenant = await get_default_tenant(db)
+        if tenant:
+            print(f"[AGENT] ⚠️ FALLBACK TO DEFAULT TENANT — dialed number "
+                  f"{number or 'unknown'!r} matched NO tenant; using default "
+                  f"{tenant.id} ({tenant.business_name}). Routing was NOT deterministic "
+                  "(this is the silent fallback, now made visible).", flush=True)
+
     if not tenant:
+        print("[AGENT] no tenants exist at all — nothing to serve this call", flush=True)
         return None
+
     config = await load_tenant_config(db, tenant)
+    niche = tenant.niche.value if tenant.niche else "clinic"
+    print(f"[AGENT] FINAL resolved tenant: {tenant.id} ({tenant.business_name}) "
+          f"niche={niche} for dialed={number or 'unknown'}", flush=True)
     return tenant.id, config

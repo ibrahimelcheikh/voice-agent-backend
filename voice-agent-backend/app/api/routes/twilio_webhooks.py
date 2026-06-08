@@ -60,12 +60,18 @@ async def handle_inbound_call(request: Request, db: AsyncSession = Depends(get_d
 
     tenant = await resolve_tenant_by_number(db, called)
     if not tenant:
-        print(f"[twilio] inbound to {called!r} matches no tenant — playing 'not configured'")
+        print(f"[WEBHOOK] inbound To={called!r} -> NO TENANT MATCH "
+              "— playing 'not configured' and hanging up", flush=True)
         return Response(content=_not_configured_twiml(), media_type="application/xml")
 
-    print(f"[twilio] inbound to {called!r} routed to tenant {tenant.id} ({tenant.business_name})")
     # Use the tenant's own number as the SIP user part so the agent resolves the same
-    # tenant from the SIP join (consistent with how `To` matched it here).
+    # tenant from the SIP join (consistent with how `To` matched it here). Log the exact
+    # SIP URI we bridge to (built the same way as _sip_dial_twiml) so the full hop is visible.
+    sip_number = tenant.twilio_phone_number or called
+    sip_uri = f"sip:{sip_number}@{_livekit_sip_host()};transport=tcp"
+    niche = tenant.niche.value if tenant.niche else "clinic"
+    print(f"[WEBHOOK] inbound To={called!r} -> tenant {tenant.id} "
+          f"({tenant.business_name}) niche={niche}; bridging to {sip_uri}", flush=True)
     return Response(content=_sip_dial_twiml(tenant.twilio_phone_number or called),
                     media_type="application/xml")
 

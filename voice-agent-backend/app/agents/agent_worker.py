@@ -81,7 +81,7 @@ async def _request_fnc(req: JobRequest):
     not routing the room to this agent_name (name mismatch) or no room was created — the
     problem is upstream of this handler."""
     room_name = (req.room.name if req.room else "") or ""
-    print(f"[worker] ◀ JOB REQUEST received for room {room_name!r} — accepting", flush=True)
+    print(f"[WORKER] ◀ JOB REQUEST received for room {room_name!r} — accepting", flush=True)
     await req.accept()
 
 
@@ -98,11 +98,11 @@ def main():
     opts = dict(entrypoint_fnc=entrypoint, request_fnc=_request_fnc)
     if settings.AGENT_NAME:
         opts["agent_name"] = settings.AGENT_NAME
-        print(f"[worker] registering with agent_name={settings.AGENT_NAME!r} "
+        print(f"[WORKER] registering with agent_name={settings.AGENT_NAME!r} "
               "(EXPLICIT dispatch — must match the SIP dispatch rule's agent name)",
               flush=True)
     else:
-        print("[worker] registering with NO agent_name (AUTOMATIC dispatch — offered every "
+        print("[WORKER] registering with NO agent_name (AUTOMATIC dispatch — offered every "
               "room; only correct if the dispatch rule has no explicit agent)", flush=True)
     cli.run_app(WorkerOptions(**opts))
 

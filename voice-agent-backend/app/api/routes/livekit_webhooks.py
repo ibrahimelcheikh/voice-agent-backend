@@ -45,8 +45,12 @@ async def livekit_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             # The web service does NOT spawn agents. The dedicated agent_worker
             # process joins the room (via LiveKit automatic dispatch) and owns the
             # Call record. We only log here so there is exactly one agent per call.
-            print(f"[livekit] SIP caller {event.participant.identity} joined "
-                  f"room {event.room.name} — agent_worker will handle it")
+            # Dump every SIP attribute present on the join so the dialed/caller numbers
+            # the agent will read are visible at this hop too.
+            attrs = dict(getattr(event.participant, "attributes", None) or {})
+            print(f"[LK-HOOK] SIP caller {event.participant.identity!r} joined "
+                  f"room {event.room.name!r} — SIP attributes={attrs!r} "
+                  "(agent_worker will handle it)", flush=True)
 
         elif event.event == "room_finished":
             room_name = event.room.name
@@ -60,9 +64,9 @@ async def livekit_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 if call.started_at:
                     call.duration_seconds = int((call.ended_at - call.started_at).total_seconds())
                 await db.commit()
-                print(f"[livekit] room {room_name} finished, call closed")
+                print(f"[LK-HOOK] room {room_name!r} finished, call closed", flush=True)
 
     except Exception as e:
-        print(f"[livekit] webhook error: {type(e).__name__}: {e}")
+        print(f"[LK-HOOK] webhook error: {type(e).__name__}: {e}", flush=True)
 
     return {"status": "ok"}
