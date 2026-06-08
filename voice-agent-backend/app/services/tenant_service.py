@@ -20,6 +20,7 @@ import re
 
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.models.models import Tenant, Agent, AgentType, BehaviorConfig
 
 # Default greeting/system prompt when a tenant hasn't set its own. Kept generic; the
@@ -221,15 +222,20 @@ def log_sip_attributes(room) -> None:
 async def tenant_context_for_room(db, room) -> tuple[str, dict] | None:
     """Resolve (tenant_id, config) for a freshly-joined inbound `call-*` room.
 
-    Reads the dialed number off the SIP join and matches it to a tenant. If the number
-    can't be read (SIP attributes are best-effort across providers), falls back to the
-    default tenant so the original single-tenant clinic keeps working. Returns None only
-    when there are no tenants at all (nothing to serve).
+    DETERMINISTIC ROUTING (Phase 1): reads the DIALED number off the SIP participant's
+    attributes and matches it to exactly one tenant. The caller MUST wait for the SIP
+    participant to join before calling this (see clinic_agent.entrypoint) — otherwise the
+    attributes aren't present yet and the dialed number can't be read.
 
-    INSTRUMENTED (Phase 0): dumps every SIP attribute, logs the dialed number (or
-    'could not read'), and emits a LOUD ⚠️ FALLBACK TO DEFAULT TENANT line whenever the
-    dialed number matched no tenant — so the default-tenant fallback is never silent.
-    Behavior is unchanged: the same tenant is resolved exactly as before."""
+    No silent fallback: when the dialed number matches no tenant we return None so the
+    agent ends the call instead of answering as the wrong business. The default-tenant
+    fallback is still available but ONLY when ALLOW_DEFAULT_TENANT_FALLBACK is set.
+
+    Returns None when no tenant can be resolved (no match + fallback disabled, or no
+    tenants at all).
+
+    INSTRUMENTED (Phase 0 logging preserved): dumps every SIP attribute and logs the
+    dialed number (or 'could not read') and the final resolved tenant."""
     room_name = getattr(room, "name", "?")
     print(f"[AGENT] resolving tenant for room {room_name!r}", flush=True)
     log_sip_attributes(room)
@@ -244,16 +250,20 @@ async def tenant_context_for_room(db, room) -> tuple[str, dict] | None:
     if tenant:
         print(f"[AGENT] dialed number {number!r} matched tenant {tenant.id} "
               f"({tenant.business_name}) — deterministic routing", flush=True)
-    else:
+    elif settings.ALLOW_DEFAULT_TENANT_FALLBACK:
         tenant = await get_default_tenant(db)
         if tenant:
-            print(f"[AGENT] ⚠️ FALLBACK TO DEFAULT TENANT — dialed number "
-                  f"{number or 'unknown'!r} matched NO tenant; using default "
-                  f"{tenant.id} ({tenant.business_name}). Routing was NOT deterministic "
-                  "(this is the silent fallback, now made visible).", flush=True)
+            print(f"[AGENT] ⚠️ FALLBACK TO DEFAULT TENANT (explicitly enabled via "
+                  f"ALLOW_DEFAULT_TENANT_FALLBACK) — dialed {number or 'unknown'!r} matched "
+                  f"no tenant; using default {tenant.id} ({tenant.business_name})", flush=True)
+    else:
+        print(f"[AGENT] ❌ NO TENANT for dialed number {number or 'unknown'!r} — cannot route. "
+              "Silent default fallback is DISABLED, so the agent will NOT answer as the wrong "
+              "business; the call will be ended.", flush=True)
+        return None
 
     if not tenant:
-        print("[AGENT] no tenants exist at all — nothing to serve this call", flush=True)
+        print("[AGENT] no tenant available to serve this call (no tenants exist?)", flush=True)
         return None
 
     config = await load_tenant_config(db, tenant)

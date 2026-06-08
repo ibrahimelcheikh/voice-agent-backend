@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # (worker registers with no name and is offered every room) — only do that if the
     # dispatch rule has NO explicit agent configured.
     AGENT_NAME: str = "clinic-agent"
+    # DETERMINISTIC INBOUND ROUTING: when a dialed number matches NO tenant, the agent
+    # ends the call rather than silently answering as the default clinic (answering as the
+    # wrong business is worse than not answering). Set True ONLY to restore the old
+    # single-tenant behavior where any unmatched call falls back to the default tenant.
+    ALLOW_DEFAULT_TENANT_FALLBACK: bool = False
     DEEPGRAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
     # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | openai.

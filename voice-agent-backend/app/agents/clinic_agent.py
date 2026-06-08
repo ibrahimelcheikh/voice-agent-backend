@@ -561,6 +561,78 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
             print(f"[agent] reminder finalize error: {type(e).__name__}: {e}")
 
 
+def _is_sip_participant(p) -> bool:
+    """True for a real phone caller (SIP participant) vs. our own agent participant."""
+    try:
+        from livekit.protocol import models as m
+        if getattr(p, "kind", None) == m.ParticipantInfo.Kind.SIP:
+            return True
+    except Exception:
+        pass
+    return "sip" in (getattr(p, "identity", "") or "").lower()
+
+
+async def _wait_for_sip_participant(room, timeout: float = 10.0):
+    """Wait until the real SIP caller has joined the room, then return that participant.
+
+    The DIALED number lives on the SIP participant's attributes and is only readable once
+    it has joined. Resolving the tenant before this point is the race that made every call
+    fall back to the default tenant ('no remote participants yet' → 'COULD NOT READ' →
+    'FALLBACK'). Polls remote_participants up to `timeout` seconds. Returns the SIP
+    participant, or None if none appears in time."""
+    print(f"[AGENT] waiting up to {timeout:.0f}s for the SIP participant to join "
+          f"room {getattr(room, 'name', '?')!r}…", flush=True)
+    waited_ms = 0
+    interval = 0.25
+    while True:
+        try:
+            for p in room.remote_participants.values():
+                if _is_sip_participant(p):
+                    if waited_ms:
+                        print(f"[AGENT] SIP participant present after waiting {waited_ms}ms",
+                              flush=True)
+                    return p
+        except Exception:
+            pass
+        if waited_ms >= int(timeout * 1000):
+            return None
+        await asyncio.sleep(interval)
+        waited_ms += int(interval * 1000)
+
+
+async def _load_config_for_tenant(tenant_id):
+    """Load a tenant's agent config (greeting/system_prompt/voice/niche/…) by id. Used for
+    OUTBOUND reminder calls whose tenant is known from the appointment (not the dialed
+    number). Returns {} if the tenant can't be loaded."""
+    if not tenant_id:
+        return {}
+    try:
+        from app.db.database import AsyncSessionLocal
+        from app.services.tenant_service import load_tenant_config
+        from app.models.models import Tenant
+        async with AsyncSessionLocal() as db:
+            tenant = await db.get(Tenant, tenant_id)
+            if not tenant:
+                return {}
+            return await load_tenant_config(db, tenant)
+    except Exception as e:
+        print(f"[AGENT] load config for tenant {tenant_id} failed: {type(e).__name__}: {e}",
+              flush=True)
+        return {}
+
+
+async def _end_call_no_tenant(ctx, room_name: str):
+    """No tenant owns the dialed number — end the call WITHOUT answering as any business.
+    We deliberately do not speak a greeting (which business would we be?). Best-effort
+    disconnect so the call ends cleanly instead of the agent answering as the wrong shop."""
+    print(f"[AGENT] ❌ ending call in room {room_name} — no tenant for the dialed number "
+          "(refusing to answer as the wrong business)", flush=True)
+    try:
+        await ctx.room.disconnect()
+    except Exception as e:
+        print(f"[AGENT] disconnect after no-tenant failed: {type(e).__name__}: {e}", flush=True)
+
+
 # ── Entry point 1: dedicated worker (livekit-agents dispatches a job) ─────────
 async def entrypoint(ctx):
     from livekit.agents import AutoSubscribe
@@ -591,29 +663,43 @@ async def entrypoint(ctx):
         await ctx.room.disconnect()
         return
 
-    # PHONE -> TENANT ROUTING: resolve the tenant from the DIALED number on the SIP join
-    # and load that tenant's config (greeting, system prompt, voice). This happens here, at
-    # call time, looked up from the DB — it is NOT required as pre-set job metadata, so a
-    # plain inbound SIP call resolves its tenant fine. Never throws: on any failure it
-    # returns the default tenant (or empty config) so the agent STILL answers the call.
-    tenant_id, behavior_config = await _resolve_tenant(ctx.room)
+    # Wait for the real SIP caller to JOIN before reading its attributes. The dialed number
+    # lives on the SIP participant's attributes and isn't present at connect time — resolving
+    # the tenant before the participant joins is the race that forced every call onto the
+    # default clinic ('no remote participants yet' → 'COULD NOT READ' → 'FALLBACK').
+    sip_participant = await _wait_for_sip_participant(ctx.room, timeout=10.0)
+    if sip_participant is not None:
+        print(f"[AGENT] SIP participant joined room {room_name}: "
+              f"identity={getattr(sip_participant, 'identity', '?')!r} "
+              f"kind={getattr(sip_participant, 'kind', '?')}", flush=True)
+    else:
+        print(f"[AGENT] ⚠️ no SIP participant joined room {room_name} within 10s — "
+              "the dialed number may be unreadable; resolution will reflect that", flush=True)
 
-    # Is this room one of our outbound reminder calls? If so we already have a Call
-    # record (created when the call was placed) and the appointment context; otherwise
-    # it's a normal inbound call and we create an inbound Call record.
+    # Is this room one of our OUTBOUND reminder calls? Those carry their tenant from the
+    # appointment (the dialed number on an outbound call is the PATIENT's number, which
+    # matches no tenant), so resolve that first and skip dialed-number routing for them.
     call_context = None
     try:
         from app.services.reminder_service import resolve_outbound_context_for_room
         call_context = await resolve_outbound_context_for_room(ctx.room)
     except Exception as e:
-        print(f"[worker] outbound context resolve failed: {type(e).__name__}: {e}")
+        print(f"[AGENT] outbound context resolve failed: {type(e).__name__}: {e}", flush=True)
 
     if call_context:
+        tenant_id = call_context.get("tenant_id")
+        behavior_config = await _load_config_for_tenant(tenant_id)
         call_id = call_context.get("call_id")
-        tenant_id = call_context.get("tenant_id") or tenant_id
-        print(f"[worker] room {room_name} is an outbound reminder for appointment "
-              f"{call_context.get('appointment_id')} (tenant {tenant_id})")
+        print(f"[AGENT] room {room_name} is an outbound reminder for appointment "
+              f"{call_context.get('appointment_id')} (tenant {tenant_id})", flush=True)
     else:
+        # INBOUND: resolve the tenant DETERMINISTICALLY from the real dialed number now that
+        # the SIP participant is present. No silent fallback — if no tenant owns the number,
+        # end the call rather than answer as the wrong business.
+        tenant_id, behavior_config = await _resolve_tenant(ctx.room)
+        if not tenant_id:
+            await _end_call_no_tenant(ctx, room_name)
+            return
         call_id = await _create_call_record(tenant_id, behavior_config, room_name, None)
 
     await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True,
@@ -665,9 +751,11 @@ async def run_agent_in_room(room_name: str, behavior_config: dict | None = None,
 async def _resolve_tenant(room):
     """Phone -> tenant resolution for a joined `call-*` room. Returns (tenant_id, config)
     where config is the tenant's agent config (greeting, system_prompt, voice_id,
-    max_call_duration). Reads the dialed number off the SIP join; falls back to the
-    default tenant when it can't be read so the original clinic keeps working. Never
-    raises — returns (None, {}) on failure."""
+    max_call_duration). Reads the DIALED number off the SIP participant's attributes (the
+    caller must have already joined — see entrypoint's _wait_for_sip_participant) and matches
+    it to exactly one tenant. DETERMINISTIC: no silent default fallback (unless
+    ALLOW_DEFAULT_TENANT_FALLBACK is set). Returns (None, {}) when no tenant can be resolved,
+    which the caller treats as 'cannot route — end the call'. Never raises."""
     try:
         from app.db.database import AsyncSessionLocal
         from app.services.tenant_service import tenant_context_for_room, sip_called_number
@@ -688,13 +776,13 @@ async def _resolve_tenant(room):
                   f"({config.get('niche')}) for dialed number {dialed or 'unknown'} "
                   f"[tenant_id={tenant_id}]", flush=True)
             return tenant_id, config
-        print(f"[AGENT] no tenant resolved for dialed number {dialed or 'unknown'}; "
-              "running with defaults", flush=True)
+        print(f"[AGENT] no tenant resolved for dialed number {dialed or 'unknown'} — "
+              "deterministic routing found no match; caller will NOT be answered", flush=True)
         return None, {}
     except Exception as e:
-        # Tenant resolution must NEVER stop the agent from answering — fall back to defaults.
-        print(f"[AGENT] tenant resolve failed: {type(e).__name__}: {e}; running with defaults",
-              flush=True)
+        # On error we do NOT guess a tenant — better to end the call than answer as the
+        # wrong business. The caller (entrypoint) ends the call when this returns no tenant.
+        print(f"[AGENT] tenant resolve error: {type(e).__name__}: {e}; cannot route", flush=True)
         return None, {}
 
 
