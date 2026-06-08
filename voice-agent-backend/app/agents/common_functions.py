@@ -13,6 +13,7 @@ Both are strictly tenant-scoped and strictly grounded:
 from sqlalchemy import select
 
 from app.db.database import AsyncSessionLocal
+from app.core.tenant_scope import scope_query as _scope, require_tenant_id
 from app.models.models import (
     Tenant, Patient, Appointment, AppointmentStatus,
     Reservation, ReservationStatus, Order, Lead,
@@ -49,6 +50,7 @@ async def faq_lookup(query=None, tenant_id=None) -> dict:
     """Answer a general question from the tenant's knowledge base only. Returns the matched
     KB sections; the guardrail's strict wrapper makes the LLM phrase ONLY these, and offer a
     human handoff when the KB has nothing relevant."""
+    require_tenant_id(tenant_id, "faq_lookup")
     async with AsyncSessionLocal() as db:
         tenant = await db.get(Tenant, tenant_id) if tenant_id else None
         kb = (tenant.knowledge_base if tenant else None) or {}
@@ -70,6 +72,7 @@ async def recognize_caller(phone=None, niche=None, tenant_id=None) -> dict:
       restaurant        → reservations / orders by phone
       real_estate/...   → existing leads
     Returns {found: False} for an unknown caller — the agent just greets normally."""
+    require_tenant_id(tenant_id, "recognize_caller")
     if not phone:
         return {"found": False}
     niche = (niche or "clinic").lower()
@@ -79,12 +82,6 @@ async def recognize_caller(phone=None, niche=None, tenant_id=None) -> dict:
         if niche in _LEAD_NICHES:
             return await _recognize_lead(db, phone, tenant_id)
         return await _recognize_clinic(db, phone, tenant_id)
-
-
-def _scope(query, model, tenant_id):
-    if tenant_id:
-        return query.where(model.tenant_id == tenant_id)
-    return query
 
 
 async def _recognize_clinic(db, phone, tenant_id):

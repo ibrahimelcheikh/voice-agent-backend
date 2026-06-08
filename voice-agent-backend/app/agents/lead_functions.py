@@ -15,13 +15,8 @@ invented — the agent saves exactly what the caller said.
 from sqlalchemy import select
 
 from app.db.database import AsyncSessionLocal
+from app.core.tenant_scope import scope_query as _scope, require_tenant_id
 from app.models.models import Lead, LeadStatus
-
-
-def _scope(query, model, tenant_id):
-    if tenant_id:
-        return query.where(model.tenant_id == tenant_id)
-    return query
 
 
 async def capture_lead(customer_name=None, phone=None, lead_type=None, budget=None,
@@ -32,6 +27,7 @@ async def capture_lead(customer_name=None, phone=None, lead_type=None, budget=No
 
     If the same phone already has an open lead this call's details are merged into it
     rather than creating a duplicate, so a multi-turn collection stays one lead."""
+    require_tenant_id(tenant_id, "capture_lead")
     async with AsyncSessionLocal() as db:
         missing = [k for k, v in {"customer_name": customer_name, "phone": phone}.items()
                    if not v]
@@ -69,6 +65,7 @@ async def capture_lead(customer_name=None, phone=None, lead_type=None, budget=No
 async def check_lead(phone=None, tenant_id=None) -> dict:
     """Look up whether this caller already has a lead on file (so a returning caller isn't
     re-interviewed from scratch)."""
+    require_tenant_id(tenant_id, "check_lead")
     async with AsyncSessionLocal() as db:
         if not phone:
             return {"success": False, "reason": "need_phone"}

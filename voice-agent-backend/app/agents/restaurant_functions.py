@@ -19,16 +19,10 @@ from datetime import date
 from sqlalchemy import select
 
 from app.db.database import AsyncSessionLocal
+from app.core.tenant_scope import scope_query as _scope, require_tenant_id
 from app.models.models import (
     Reservation, ReservationStatus, MenuItem, Order, OrderItem, OrderStatus,
 )
-
-
-def _scope(query, model, tenant_id):
-    """Add a tenant filter when a tenant_id is supplied — the multi-tenant guard."""
-    if tenant_id:
-        return query.where(model.tenant_id == tenant_id)
-    return query
 
 
 def _dollars(cents) -> str:
@@ -53,6 +47,7 @@ async def create_reservation(customer_name=None, phone=None, party_size=None,
     """Create a table reservation. Requires name, phone, party size, date, and time —
     the agent collects them across turns and this fires once they are all present (the
     final affirmation completes it), so a reservation is only saved on confirmation."""
+    require_tenant_id(tenant_id, "create_reservation")
     async with AsyncSessionLocal() as db:
         party = _coerce_party(party_size)
         missing = [k for k, v in {"customer_name": customer_name, "phone": phone,
@@ -75,6 +70,7 @@ async def modify_reservation(phone=None, reservation_id=None, new_date=None,
                             new_time=None, party_size=None, tenant_id=None) -> dict:
     """Move/resize a reservation. Targets a specific reservation_id when known, else the
     caller's soonest open reservation (by phone)."""
+    require_tenant_id(tenant_id, "modify_reservation")
     async with AsyncSessionLocal() as db:
         if not new_date and not new_time and not _coerce_party(party_size):
             return {"success": False, "reason": "need_change"}
@@ -97,6 +93,7 @@ async def modify_reservation(phone=None, reservation_id=None, new_date=None,
 
 
 async def cancel_reservation(phone=None, reservation_id=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "cancel_reservation")
     async with AsyncSessionLocal() as db:
         resv = await _find_open_reservation(db, phone, reservation_id, tenant_id)
         if not resv:
@@ -108,6 +105,7 @@ async def cancel_reservation(phone=None, reservation_id=None, tenant_id=None) ->
 
 
 async def check_reservation(phone=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "check_reservation")
     async with AsyncSessionLocal() as db:
         if not phone:
             return {"success": False, "reason": "need_phone"}
@@ -212,6 +210,7 @@ async def menu_lookup(menu_query=None, tenant_id=None) -> dict:
       * It NEVER returns empty while the tenant has menu items: at minimum it lists what's
         available, so the agent can always tell the caller what's on offer.
     """
+    require_tenant_id(tenant_id, "menu_lookup")
     async with AsyncSessionLocal() as db:
         items = (await db.execute(
             _scope(select(MenuItem).where(MenuItem.available == True),  # noqa: E712
@@ -265,6 +264,7 @@ async def take_order(items=None, customer_name=None, phone=None, pickup_time=Non
     unrecognised so it can clarify. Because the required fields come together at the end,
     this naturally saves on the caller's final confirmation.
     """
+    require_tenant_id(tenant_id, "take_order")
     async with AsyncSessionLocal() as db:
         if not items:
             return {"success": False, "reason": "no_items"}
@@ -335,6 +335,7 @@ async def take_order(items=None, customer_name=None, phone=None, pickup_time=Non
 
 async def check_order(phone=None, order_id=None, tenant_id=None) -> dict:
     """Look up a caller's most recent order + its status (received/preparing/ready/done)."""
+    require_tenant_id(tenant_id, "check_order")
     async with AsyncSessionLocal() as db:
         q = _scope(select(Order), Order, tenant_id)
         if order_id:
@@ -347,7 +348,8 @@ async def check_order(phone=None, order_id=None, tenant_id=None) -> dict:
         if not order:
             return {"success": True, "found": False}
         lines = (await db.execute(
-            select(OrderItem).where(OrderItem.order_id == order.id)
+            _scope(select(OrderItem).where(OrderItem.order_id == order.id),
+                   OrderItem, tenant_id)
         )).scalars().all()
         return {"success": True, "found": True, "order_id": order.id,
                 "status": order.status.value, "pickup_time": order.pickup_time,

@@ -20,20 +20,13 @@ from datetime import datetime, date, timedelta
 from sqlalchemy import select, desc, func as safunc
 
 from app.db.database import AsyncSessionLocal
+from app.core.tenant_scope import scope_query as _scope, require_tenant_id
 from app.models.models import (
     Clinic, Doctor, Service, Patient, Appointment, InsuranceProvider,
     AppointmentStatus,
 )
 
 _WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-
-def _scope(query, model, tenant_id):
-    """Add a tenant filter to a query when a tenant_id is supplied. Centralizes the
-    multi-tenant guard so no function can forget it."""
-    if tenant_id:
-        return query.where(model.tenant_id == tenant_id)
-    return query
 
 
 def _weekday_key(date_str: str) -> str | None:
@@ -82,6 +75,7 @@ async def _match_doctor(db, doctor: str, tenant_id=None, clinic_id=None):
 
 async def book_appointment(patient_name=None, phone=None, doctor=None, date=None,
                            time=None, reason=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "book_appointment")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
         if not phone or not patient_name or not date or not time:
@@ -131,6 +125,7 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, date=None
 # ── 2. Cancel ────────────────────────────────────────────────────────────────
 
 async def cancel_appointment(phone=None, appointment_id=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "cancel_appointment")
     async with AsyncSessionLocal() as db:
         q = _scope(select(Appointment).where(
             Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
@@ -161,6 +156,7 @@ async def cancel_appointment(phone=None, appointment_id=None, tenant_id=None) ->
 
 async def reschedule_appointment(phone=None, new_date=None, new_time=None,
                                  appointment_id=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "reschedule_appointment")
     async with AsyncSessionLocal() as db:
         if not new_date or not new_time:
             return {"success": False, "reason": "need_new_date_time"}
@@ -199,6 +195,7 @@ async def confirm_appointment(phone=None, appointment_id=None, tenant_id=None) -
     """Mark an appointment confirmed. Used by the outbound reminder agent when the
     patient says they'll keep the appointment. Targets a specific appointment_id when
     known (reminder calls always pass it), else the patient's soonest open appointment."""
+    require_tenant_id(tenant_id, "confirm_appointment")
     async with AsyncSessionLocal() as db:
         q = _scope(select(Appointment).where(
             Appointment.status.notin_([AppointmentStatus.cancelled, AppointmentStatus.completed])
@@ -228,6 +225,7 @@ async def confirm_appointment(phone=None, appointment_id=None, tenant_id=None) -
 # ── 4. Check ─────────────────────────────────────────────────────────────────
 
 async def check_appointment(phone=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "check_appointment")
     async with AsyncSessionLocal() as db:
         if not phone:
             return {"success": False, "reason": "need_phone"}
@@ -261,6 +259,7 @@ async def check_appointment(phone=None, tenant_id=None) -> dict:
 # ── 5. Clinic hours ──────────────────────────────────────────────────────────
 
 async def get_clinic_hours(tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "get_clinic_hours")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
         if not clinic:
@@ -272,6 +271,7 @@ async def get_clinic_hours(tenant_id=None) -> dict:
 # ── 6. Clinic location ───────────────────────────────────────────────────────
 
 async def get_clinic_location(tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "get_clinic_location")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
         if not clinic:
@@ -283,6 +283,7 @@ async def get_clinic_location(tenant_id=None) -> dict:
 # ── 7. Services ──────────────────────────────────────────────────────────────
 
 async def get_services(tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "get_services")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
         services = (await db.execute(
@@ -298,6 +299,7 @@ async def get_services(tenant_id=None) -> dict:
 # ── 8. Doctor availability ───────────────────────────────────────────────────
 
 async def check_doctor_availability(doctor=None, date=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "check_doctor_availability")
     async with AsyncSessionLocal() as db:
         doc = await _match_doctor(db, doctor or "", tenant_id)
         if not doc:
@@ -320,6 +322,7 @@ async def check_doctor_availability(doctor=None, date=None, tenant_id=None) -> d
 # ── 9. Insurance ─────────────────────────────────────────────────────────────
 
 async def check_insurance(insurance_provider=None, tenant_id=None) -> dict:
+    require_tenant_id(tenant_id, "check_insurance")
     async with AsyncSessionLocal() as db:
         if not insurance_provider:
             providers = (await db.execute(
