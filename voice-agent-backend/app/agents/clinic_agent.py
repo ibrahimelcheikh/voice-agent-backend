@@ -601,42 +601,55 @@ def _make_agent_class():
                 _log(f"greeting error: {type(e).__name__}: {e}")
 
         async def _select_language(self):
-            """Phase 3a — brief bilingual prompt + keypad (DTMF) language capture, run BEFORE
-            the greeting. Stores the chosen code on self._call_language and LOGS it. It NEVER
-            branches behaviour on the value — the greeting / LLM / TTS below are byte-for-byte
-            today's English flow (Arabic generation arrives in 3b).
+            """Phase 3a/3b — brief bilingual prompt + keypad (DTMF) language capture, run BEFORE
+            the greeting. Stores the chosen code on self._call_language and LOGS the LOCK. The
+            menu plays EXACTLY ONCE per call and is NEVER added to the LLM chat context, so it
+            can never be 'replayed' by generation on a later user turn.
 
             Multi-language tenants only; for a single-language tenant (no prompt) it just
             records the primary language and returns — no keypad step at all. A missed
-            keypress (timeout) or an invalid digit defaults to the PRIMARY (first) language;
+            keypress (timeout) or only invalid digits default to the PRIMARY (first) language;
             the call is never blocked or dropped waiting for a key."""
+            # One-shot guard: once a language is locked, NEVER speak the menu again. Belt-and-
+            # braces against any accidental re-entry of on_enter / _select_language.
+            if self._call_language is not None:
+                _log(f"[AGENT] language already LOCKED = {self._call_language} — menu not replayed")
+                return
             languages = self._languages or ["en"]
             primary = languages[0]
             if not self._language_prompt or len(languages) < 2:
                 self._call_language = primary
+                _log(f"[AGENT] single-language tenant — language LOCKED = {primary}")
                 return
             try:
-                _log("language prompt: speaking")
-                await self.session.say(self._language_prompt, allow_interruptions=False)
+                _log("language prompt: speaking (once, not added to chat context)")
+                # add_to_chat_ctx=False: the IVR menu must NOT become an assistant message, or
+                # the LLM can regurgitate 'For English press 1...' on a later confused turn.
+                await self.session.say(self._language_prompt, allow_interruptions=False,
+                                       add_to_chat_ctx=False)
             except Exception as e:
                 _log(f"language prompt error: {type(e).__name__}: {e}")
-            # Wait briefly for a keypress. The DTMF handler (registered on the room in
-            # _serve) fills dtmf_holder['selected'] and sets dtmf_event. On timeout we
-            # simply default — never hang.
-            if self._dtmf_event is not None:
+            # Wait for a VALID keypress up to a deadline. A stray/invalid press wakes the event
+            # but must NOT end the wait — keep listening for a real digit until the deadline so
+            # a fat-fingered key before '2' can't lock English. Never hang past the deadline.
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + 6.0
+            while self._dtmf_event is not None and not (self._dtmf_holder or {}).get("selected"):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                self._dtmf_event.clear()
                 try:
-                    await asyncio.wait_for(self._dtmf_event.wait(), timeout=6.0)
+                    await asyncio.wait_for(self._dtmf_event.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    pass
+                    break
             selected = (self._dtmf_holder or {}).get("selected")
             if selected:
-                self._call_language = selected   # handler already logged the selection
+                self._call_language = selected
+                _log(f"[AGENT] language LOCKED = {selected} (via DTMF)")
             else:
                 self._call_language = primary
-                # A true no-input timeout (event never set) is logged here; an invalid
-                # digit was already logged by the handler, so don't double-log it.
-                if self._dtmf_event is None or not self._dtmf_event.is_set():
-                    _log(f"[AGENT] no DTMF — defaulting to {primary}")
+                _log(f"[AGENT] no valid DTMF — language LOCKED = {primary} (default)")
 
         async def stt_node(self, audio, model_settings):
             """Per-call STT routing (Phase 3b fix). Arabic branch -> OpenAI Whisper (strong
@@ -802,9 +815,10 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
 
         def _on_dtmf(ev, _languages=languages, _primary=primary):
             """LiveKit rtc.SipDTMF handler: map the keypad digit to a language by position
-            (1 -> languages[0], 2 -> languages[1], …). Valid digit -> store it; invalid digit
-            -> treat as no-input (default to primary). Always resolves the wait so the call
-            proceeds immediately on a keypress."""
+            (1 -> languages[0], 2 -> languages[1], …). The FIRST VALID press wins and is never
+            overwritten by a later/stray press; an invalid digit is logged but does NOT clobber
+            a good selection (so a fat-fingered key before '2' can't silently lock English).
+            Always resolves the wait so the call proceeds immediately on a keypress."""
             try:
                 digit = (getattr(ev, "digit", "") or "").strip()
                 if not digit:
@@ -812,15 +826,19 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                     digit = str(code) if code is not None else ""
                 idx = int(digit) - 1 if digit.isdigit() else -1
                 if 0 <= idx < len(_languages):
-                    dtmf_holder["selected"] = _languages[idx]
-                    print(f"[AGENT] call language selected via DTMF = {_languages[idx]}",
+                    lang = _languages[idx]
+                    # First valid press wins — don't let a second keypress change it.
+                    if not dtmf_holder.get("selected"):
+                        dtmf_holder["selected"] = lang
+                    # The exact capture trace Ibrahim asked for — fires on EVERY keypress.
+                    print(f"[AGENT] DTMF digit received = {digit} -> language = {lang}",
                           flush=True)
                 else:
-                    dtmf_holder["selected"] = None
-                    print(f"[AGENT] invalid DTMF digit {digit!r} — defaulting to {_primary}",
-                          flush=True)
+                    # Invalid digit: log it, but keep any valid selection already captured.
+                    fallback = dtmf_holder.get("selected") or _primary
+                    print(f"[AGENT] DTMF digit received = {digit!r} -> invalid, "
+                          f"keeping language = {fallback}", flush=True)
             except Exception as e:
-                dtmf_holder["selected"] = None
                 print(f"[AGENT] DTMF handler error: {type(e).__name__}: {e}", flush=True)
             finally:
                 dtmf_event.set()
