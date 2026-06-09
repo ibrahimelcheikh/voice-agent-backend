@@ -194,11 +194,18 @@ class GuardrailBrain:
     def __init__(self, *, openai_api_key: str, today: str, model: str = "gpt-4o-mini",
                  max_unclear: int = 5, seed_entities: dict | None = None,
                  pending_intent: str | None = None, tenant_id: str | None = None,
-                 niche: str | None = None):
+                 niche: str | None = None, normalize_items_to_english: bool = False):
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=openai_api_key)
         self._model = model
         self._today = today
+        # Phase 3b fix: when the caller speaks a non-English language (the Arabic agent sets
+        # this True), the classifier must output order item names as the EXACT English menu
+        # names so the pure-English menu matcher (restaurant_functions.take_order) matches them.
+        # English calls leave this False -> the classifier prompt is byte-for-byte unchanged.
+        # _menu_names is the tenant's real menu, loaded once on demand and cached for the call.
+        self._normalize_items = normalize_items_to_english
+        self._menu_names: list | None = None
         # Tenant whose data this call operates on. Passed into every data function so
         # the agent can only ever read/write THIS business's data — no cross-tenant leak.
         self._tenant_id = tenant_id
@@ -398,6 +405,12 @@ class GuardrailBrain:
             kwargs = {k: self.entities.get(k) for k in self._spec.function_args.get(intent, [])}
             # Scope every data function to this call's tenant (anti-cross-tenant guard).
             kwargs["tenant_id"] = self._tenant_id
+            # [AR-DIAG] On the Arabic path, log the order item names AS PASSED to take_order
+            # (post-normalization) so we can confirm they are now English menu names, not Arabic.
+            if intent == "take_order" and self._normalize_items:
+                _names = [it.get("name") for it in (kwargs.get("items") or [])
+                          if isinstance(it, dict)]
+                logger.info("[AR-DIAG] take_order items (normalized) = %s", _names)
             tf = time.perf_counter()
             try:
                 data = await func(**kwargs)
@@ -431,6 +444,26 @@ class GuardrailBrain:
         return {"instruction": self._wrap(last_assistant, payload),
                 "intent": intent, "data": data, "end": None, "transfer": False}
 
+    async def _menu_item_names(self) -> list:
+        """The tenant's real, available menu item names (English) — loaded ONCE per call from
+        the niche's menu_lookup and cached. Used to normalize Arabic-spoken items to the exact
+        English menu names. Returns [] (and caches it) when the niche has no menu / on error, so
+        we never re-query every turn."""
+        if self._menu_names is not None:
+            return self._menu_names
+        self._menu_names = []   # cache up-front so a failure isn't retried each turn
+        fn = self._spec.functions.get("menu_lookup")
+        if not fn:
+            return self._menu_names
+        try:
+            data = await fn(tenant_id=self._tenant_id)   # no query -> full available menu
+            self._menu_names = [i["name"] for i in (data.get("items") or [])
+                                if isinstance(i, dict) and i.get("name")]
+            logger.info("📋 loaded %d menu names for item normalization", len(self._menu_names))
+        except Exception as e:
+            logger.error("menu-name load failed: %s: %s", type(e).__name__, e)
+        return self._menu_names
+
     async def _classify(self, user_text: str, last_assistant: str = "",
                         pending_intent: str | None = None, entities: dict | None = None,
                         settled: bool = False):
@@ -456,6 +489,31 @@ class GuardrailBrain:
         # menu_lookup, not faq). Empty for niches that need no extra steer.
         if self._spec.routing_hint:
             sys += "\n\n" + self._spec.routing_hint
+
+        # Phase 3b fix — Arabic order item NORMALIZATION (Arabic agent only; English is untouched).
+        # The DB/menu/matcher are English-only by design. A caller speaking Arabic says حمص/فلافل,
+        # which would reach the English matcher as Arabic and fail. So, given the tenant's REAL
+        # menu, tell the classifier to emit each order item's `name` as the EXACT English menu
+        # name. The LLM also folds spelling variants of the same spoken word (فليفل/فلافل) onto the
+        # same menu item. Quantities are unaffected. Only added when normalization is on AND the
+        # niche has a menu with items to order.
+        if self._normalize_items and "items" in self._spec.list_entities:
+            menu_names = await self._menu_item_names()
+            if menu_names:
+                sys += (
+                    "\n\nORDER ITEM NORMALIZATION (CRITICAL): This restaurant's EXACT menu items "
+                    "are:\n  " + "; ".join(menu_names) + "\n"
+                    "When you extract the `items` array, set each item's `name` to the EXACT "
+                    "English menu name from the list above that the caller is referring to — even "
+                    "when the caller speaks ARABIC (or another language) or uses a spelling "
+                    "variant. Map by meaning: e.g. حمص -> the matching English item, فلافل or its "
+                    "variant spelling فليفل -> the matching English item, شاورما دجاج -> the "
+                    "chicken shawarma item, عصير ليمون -> the lemonade item. Two spellings of the "
+                    "same spoken word MUST map to the SAME menu item. Output every item `name` in "
+                    "English exactly as written in the list. Keep quantities as the caller said "
+                    "them. Only if a named item is genuinely NOT on the list, keep the caller's "
+                    "original words so it can be reported as unavailable."
+                )
 
         # Give the classifier short-term memory of the dialogue so short replies — "yes",
         # "correct", a bare phone number or time — are interpreted against what the agent

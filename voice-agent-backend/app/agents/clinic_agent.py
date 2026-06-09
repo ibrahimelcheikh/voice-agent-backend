@@ -539,7 +539,11 @@ def _make_agent_class():
                                          today=date.today().isoformat(),
                                          seed_entities=seed_entities,
                                          pending_intent=pending_intent,
-                                         tenant_id=tenant_id, niche=niche)
+                                         tenant_id=tenant_id, niche=niche,
+                                         # Phase 3b fix: the Arabic agent normalizes spoken order
+                                         # items to the English menu names before matching. English
+                                         # agent leaves this False -> classifier prompt unchanged.
+                                         normalize_items_to_english=arabic)
             self._on_state = on_state
             self._on_end = on_end
             self._greeting = greeting or GREETING
