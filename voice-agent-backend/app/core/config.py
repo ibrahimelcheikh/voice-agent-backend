@@ -29,9 +29,11 @@ class Settings(BaseSettings):
     # Deepgram aura is lowest-latency but ENGLISH-ONLY; use cartesia for multilingual.
     TTS_PROVIDER: str = "deepgram"
     DEEPGRAM_STT_MODEL: str = "nova-2-general"
-    # Arabic STT (Phase 3b) — Deepgram with language="ar" (NOT multi, which romanizes Arabic).
-    # Arabic is supported on the nova-2 family; nova-2-general is the broadest-language tier.
-    DEEPGRAM_AR_STT_MODEL: str = "nova-2-general"
+    # Arabic STT (Phase 3b) — Deepgram with language="ar" (NOT multi). Nova-3 has a dedicated,
+    # production-grade Arabic model (17 dialect variants incl. Lebanese, streaming-supported);
+    # Nova-3 'multi' EXCLUDES Arabic, so monolingual language="ar" on nova-3 is the correct path.
+    # ("nova-3" and "nova-3-general" are the same model.)
+    DEEPGRAM_AR_STT_MODEL: str = "nova-3"
     DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
     CARTESIA_TTS_MODEL: str = "sonic-2"
     CARTESIA_VOICE: str = ""  # optional Cartesia voice id; blank = plugin default

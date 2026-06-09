@@ -299,15 +299,17 @@ def _build_cartesia_ar_tts():
 
 
 def _build_deepgram_ar_stt():
-    """Per-call Deepgram STT for the Arabic branch (Phase 3b). Uses language='ar' EXPLICITLY —
-    NOT language='multi'. 'multi' romanizes Arabic phone audio into nonsense English (the early
-    failure); the dedicated Arabic model with language='ar' transcribes Arabic properly. Whisper
-    (the previous Arabic STT) mis-heard telephone Arabic as English even with language=ar + an MSA
-    prompt, so the Arabic branch now uses Deepgram, which is streaming and handles telephony well.
+    """Per-call Deepgram STT for the Arabic branch (Phase 3b). Uses Deepgram NOVA-3 with
+    language='ar' EXPLICITLY (monolingual Arabic) — NOT 'multi'. Two reasons:
+      * Nova-3 has a dedicated, production-grade Arabic model (17 regional dialect variants incl.
+        Lebanese), streaming-supported and materially more accurate than nova-2 on phone Arabic.
+      * Nova-3's 'multi' (multilingual) set EXCLUDES Arabic (it covers en/es/fr/de/hi/ru/pt/ja/
+        it/nl only), so language='multi' would NOT transcribe Arabic — monolingual 'ar' is required.
+    Earlier attempts (Whisper language=ar, and nova-2-general language=ar) mis-heard telephone
+    Arabic as English; Nova-3 Arabic is the current GA model for this.
 
-    Arabic is supported on the nova-2 family; DEEPGRAM_AR_STT_MODEL defaults to 'nova-2-general'
-    (broadest language coverage). Streaming + interim_results + endpointing_ms=500, so turns
-    finalize incrementally from Deepgram's native endpointing — no Whisper VAD-chunking needed.
+    DEEPGRAM_AR_STT_MODEL defaults to 'nova-3'. Streaming + interim_results + endpointing_ms=500,
+    so turns finalize incrementally from Deepgram's native endpointing — no VAD-chunking needed.
 
     Reuses the SAME DEEPGRAM_API_KEY as the English path — no new credential, no new dependency.
     Returns None on failure (the Arabic call then safely keeps the English Deepgram multi STT)."""
@@ -316,11 +318,12 @@ def _build_deepgram_ar_stt():
         return None
     try:
         from livekit.plugins import deepgram
-        model = settings.DEEPGRAM_AR_STT_MODEL or "nova-2-general"
-        _log(f"Arabic STT: Deepgram {model} language=ar (streaming, interim, endpointing=500ms) — NOT multi")
+        model = settings.DEEPGRAM_AR_STT_MODEL or "nova-3"
+        _log(f"Arabic STT: Deepgram model={model} language=ar (Nova-3 monolingual Arabic, streaming, "
+             f"interim, endpointing=500ms) — NOT multi (Nova-3 multi excludes Arabic)")
         return deepgram.STT(
             model=model,
-            language="ar",            # EXPLICIT Arabic — never 'multi' (multi romanizes Arabic)
+            language="ar",            # EXPLICIT monolingual Arabic — never 'multi'
             interim_results=True,      # partials stream as the caller talks
             punctuate=True,
             smart_format=True,
@@ -542,7 +545,7 @@ def _make_agent_class():
                 _log(f"[AGENT] TTS for this call = "
                      f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
                 _log(f"[AGENT] STT for this call = "
-                     f"{'deepgram-ar (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
+                     f"{'deepgram-nova3 (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
                 # Phase 3b: on the Arabic branch ONLY, switch THIS call's turn detection from the
                 # EOU MultilingualModel to "stt" (Deepgram's native streaming endpointing). The EOU
                 # turn-detector model has NO Arabic support (no "ar" in its languages.json), so it
@@ -638,23 +641,61 @@ def _make_agent_class():
                 yield ev
 
         async def _arabic_stt_node(self, audio, model_settings):
-            """Stream the audio to the per-call Deepgram Arabic STT (language='ar'). Deepgram is a
-            STREAMING STT, so it is driven directly — no VAD StreamAdapter / Whisper chunking. Turns
+            """Stream the audio to the per-call Deepgram Arabic STT (Nova-3, language='ar'). Deepgram
+            is a STREAMING STT, so it is driven directly — no VAD StreamAdapter / chunking. Turns
             finalize from Deepgram's native streaming endpointing (endpointing_ms=500). Mirrors the
-            framework's default streaming stt_node loop, bound to self._ar_stt."""
-            from livekit.agents import utils
+            framework's default streaming stt_node loop, bound to self._ar_stt.
+
+            [AR-DIAG] TEMPORARY diagnostics (all tagged [AR-DIAG] for easy removal later): logs the
+            audio format the STT actually receives (1st frame) and the RAW transcript + Deepgram's
+            detected language/confidence on every interim & final, so we can see exactly what the
+            model gets and returns instead of guessing."""
+            from livekit.agents import stt as stt_mod, utils
             conn_options = self.session.conn_options.stt_conn_options
+            audio_logged = {"done": False}
             async with self._ar_stt.stream(conn_options=conn_options) as stream:
                 async def _forward():
                     async for frame in audio:
+                        # [AR-DIAG] log the real audio format ENTERING the STT, once. sample_rate=8000
+                        # means raw telephony (8kHz) is reaching the model; encoding is PCM16 because
+                        # LiveKit has already decoded the SIP μ-law to PCM before stt_node sees it.
+                        if not audio_logged["done"]:
+                            audio_logged["done"] = True
+                            _log(f"[AR-DIAG] STT input audio: sample_rate="
+                                 f"{getattr(frame, 'sample_rate', '?')} "
+                                 f"channels={getattr(frame, 'num_channels', '?')} "
+                                 f"samples_per_channel={getattr(frame, 'samples_per_channel', '?')} "
+                                 f"encoding=pcm16(post-decode)")
                         stream.push_frame(frame)
                     stream.end_input()
                 forward_task = asyncio.create_task(_forward())
                 try:
                     async for ev in stream:
+                        self._ar_diag_result(ev, stt_mod)   # [AR-DIAG] raw transcript + lang/conf
                         yield ev
                 finally:
                     await utils.aio.cancel_and_wait(forward_task)
+
+        @staticmethod
+        def _ar_diag_result(ev, stt_mod):
+            """[AR-DIAG] TEMPORARY: log Deepgram's raw transcript + detected language/confidence for
+            each interim/final result on the Arabic branch. Never raises into the STT loop."""
+            try:
+                t = getattr(ev, "type", None)
+                if t not in (stt_mod.SpeechEventType.INTERIM_TRANSCRIPT,
+                             stt_mod.SpeechEventType.FINAL_TRANSCRIPT):
+                    return
+                kind = "final" if t == stt_mod.SpeechEventType.FINAL_TRANSCRIPT else "interim"
+                alts = getattr(ev, "alternatives", None) or []
+                if not alts:
+                    _log(f"[AR-DIAG] raw transcript ({kind}) = <no alternatives>")
+                    return
+                a = alts[0]
+                _log(f"[AR-DIAG] Deepgram detected_language={getattr(a, 'language', None)!r} "
+                     f"confidence={getattr(a, 'confidence', None)}")
+                _log(f"[AR-DIAG] raw transcript ({kind}) = {getattr(a, 'text', '')!r}")
+            except Exception as e:
+                _log(f"[AR-DIAG] diag error: {type(e).__name__}: {e}")
 
         async def tts_node(self, text, model_settings):
             """Per-call TTS routing (Phase 3b). Arabic branch -> Cartesia (MSA); every other
