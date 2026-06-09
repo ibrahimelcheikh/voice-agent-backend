@@ -267,7 +267,12 @@ async def take_order(items=None, customer_name=None, phone=None, pickup_time=Non
     require_tenant_id(tenant_id, "take_order")
     async with AsyncSessionLocal() as db:
         if not items:
-            return {"success": False, "reason": "no_items"}
+            # The caller signalled an order but hasn't NAMED any items yet — e.g. "I'd like to
+            # order" before listing anything, or the order intro and the items landed in separate
+            # turns. This is NOT an empty menu; the guardrail turns it into a friendly "what would
+            # you like?" prompt. 'reason' is deliberately NOT "no_items" — that read as "the menu
+            # has no items" and produced a wrong "the menu is empty" reply.
+            return {"success": False, "reason": "awaiting_items"}
 
         menu = (await db.execute(
             _scope(select(MenuItem).where(MenuItem.available == True),  # noqa: E712

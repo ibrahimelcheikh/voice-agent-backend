@@ -434,7 +434,16 @@ class GuardrailBrain:
                 self.reminder_outcome = self._spec.intent_outcome[intent]
 
         payload = {"intent": intent, "data": data}
-        if isinstance(data, dict) and not data.get("success") and intent in _INCOMPLETE_TASK:
+        if (isinstance(data, dict) and not data.get("success") and intent == "take_order"
+                and data.get("reason") in ("awaiting_items", "no_items")):
+            # The caller wants to order but named no items yet (intro phrase, or intro + items
+            # split across turns). Ask what they'd like — NEVER claim the menu/order is empty.
+            payload["task"] = (
+                "The caller wants to place an order but has NOT named any items yet. Warmly ask "
+                "what they would like to order, e.g. \"Sure! What would you like?\". The full menu "
+                "IS available — NEVER say the menu is empty, the order is empty, or that you can't "
+                "process the order, and do NOT claim anything is unavailable.")
+        elif isinstance(data, dict) and not data.get("success") and intent in _INCOMPLETE_TASK:
             payload["task"] = _INCOMPLETE_TASK[intent]
         # Full-menu readback: when menu_lookup returns the whole menu, give the LLM an
         # explicit, concrete task (the real item names + prices) so it reads 2-3 in ONE

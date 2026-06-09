@@ -46,8 +46,11 @@ class Settings(BaseSettings):
     # Phase 3b polish — Arabic turn-taking. Wider than English so brief mid-utterance pauses don't
     # cut the caller off (the right trade for ordering: a little latency vs. not getting interrupted).
     # endpointing_ms = Deepgram silence before end-of-speech; the delays bound the agent's turn commit.
-    DEEPGRAM_AR_ENDPOINTING_MS: int = 1000
-    AR_MIN_ENDPOINTING_DELAY: float = 1.3
+    # Bumped (1000->1200 / 1.3->1.6s) so a pause between an order intro ("I'd like to order…") and
+    # the items ("…one falafel and one hummus") stays ONE turn instead of splitting. The conversational
+    # awaiting-items handling (guardrail) is the real safety net if it still splits.
+    DEEPGRAM_AR_ENDPOINTING_MS: int = 1200
+    AR_MIN_ENDPOINTING_DELAY: float = 1.6
     AR_MAX_ENDPOINTING_DELAY: float = 5.0
     DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
     CARTESIA_TTS_MODEL: str = "sonic-2"
