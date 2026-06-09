@@ -305,15 +305,52 @@ def _build_whisper_ar_stt():
     whisper-1 with language='ar'. Whisper is non-streaming (chunked) — it is wrapped with
     the framework's VAD StreamAdapter at use time, which is the plugin's standard handling.
 
+    Phase 3b fix #3 — make language=ar actually bite at the API call:
+      * language='ar' is stored as _opts.language and the OpenAI plugin forwards it verbatim
+        to `audio.transcriptions.create(language='ar')` (plugin stt.py _recognize_impl). Without
+        it Whisper auto-detects and, on short telephone slices, guesses English.
+      * detect_language=False — defensive: the plugin BLANKS the language whenever
+        detect_language is True, which would undo language='ar'. Force it off.
+      * prompt — a short MSA prompt biases Whisper toward Arabic so it stops emitting English
+        fragments like 'Can'/'a'. whisper-1 is the only model that honours `prompt`.
+
     Uses the already-configured OPENAI_API_KEY (the LLM provider) — no new credential. The
     OpenAI STT plugin is already imported here for the Whisper fallback in _build_stt, so no
     new dependency. Returns None on failure (the Arabic call then keeps Deepgram, logged)."""
     try:
         from livekit.plugins import openai
-        _log("Arabic STT: OpenAI Whisper-1 (language=ar, VAD-chunked)")
-        return openai.STT(model="whisper-1", language="ar", api_key=settings.OPENAI_API_KEY)
+        _log("Arabic STT: OpenAI Whisper-1 (language=ar, detect_language=False, MSA prompt, VAD-chunked)")
+        return openai.STT(
+            model="whisper-1",
+            language="ar",            # → audio.transcriptions.create(language="ar") in the plugin
+            detect_language=False,     # never auto-detect (would blank language → English guesses)
+            prompt="هذه مكالمة هاتفية باللغة العربية الفصحى.",  # bias Whisper to Arabic, not English
+            api_key=settings.OPENAI_API_KEY,
+        )
     except Exception as e:
         _log(f"Arabic STT unavailable ({type(e).__name__}: {e}); Arabic call keeps Deepgram multi")
+        return None
+
+
+def _build_arabic_vad():
+    """Dedicated Silero VAD for the Arabic Whisper branch (Phase 3b fix #3).
+
+    The Whisper StreamAdapter cuts an utterance into a chunk on every VAD END_OF_SPEECH, then
+    sends that chunk to Whisper. The session VAD's min_silence_duration is 0.3s (tuned for the
+    English path), which chops a single Arabic sentence into sub-second slices — Whisper returns
+    empty or 1-letter garbage on those. This VAD uses a WIDE 0.9s min_silence so a natural pause
+    is required before the chunk is cut, handing Whisper a COMPLETE utterance.
+
+    Arabic branch ONLY — built per Arabic call and used only inside _arabic_stt_node. The
+    session VAD used by the English path (and English turn-taking) is never touched. Returns
+    None on failure, in which case the Arabic StreamAdapter falls back to the session VAD."""
+    try:
+        from livekit.plugins import silero
+        _log("Arabic VAD: Silero min_silence_duration=0.9s, min_speech_duration=0.1s "
+             "(wide chunks so Whisper gets full Arabic utterances)")
+        return silero.VAD.load(min_silence_duration=0.9, min_speech_duration=0.1)
+    except Exception as e:
+        _log(f"Arabic VAD unavailable ({type(e).__name__}: {e}); Arabic STT falls back to session VAD")
         return None
 
 
@@ -476,7 +513,7 @@ def _make_agent_class():
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
                      seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
                      language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None,
-                     ar_tts=None, ar_greeting=None, ar_stt=None):
+                     ar_tts=None, ar_greeting=None, ar_stt=None, ar_vad=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
@@ -506,6 +543,7 @@ def _make_agent_class():
             self._ar_tts = ar_tts
             self._ar_greeting = ar_greeting
             self._ar_stt = ar_stt   # Phase 3b fix: Whisper STT used on the Arabic branch only
+            self._ar_vad = ar_vad   # Phase 3b fix #3: wide-silence VAD for the Arabic Whisper chunks
             self._arabic = False
 
         async def on_enter(self):
@@ -537,10 +575,17 @@ def _make_agent_class():
                 # never reach this and keep the EOU turn detector untouched.
                 if self._arabic:
                     try:
-                        self.session.update_options(turn_detection="vad")
+                        # Phase 3b fix #3: widen the endpointing window too. Whisper is batch +
+                        # chunked behind the wide 0.9s VAD, so its FINAL transcript arrives later
+                        # than a streaming STT's; min 1.0s / max 6.0s gives the turn time to pick
+                        # up the full utterance instead of committing an empty turn. Per-call
+                        # session only — the English path's session is built fresh and untouched.
+                        self.session.update_options(turn_detection="vad",
+                                                    min_endpointing_delay=1.0,
+                                                    max_endpointing_delay=6.0)
                         _log("[AGENT] Arabic branch: turn detection = VAD endpointing "
-                             "(EOU model OFF for this call) — Silero min_silence 0.3s, "
-                             "endpointing min 0.8s / max 4.0s")
+                             "(EOU model OFF for this call) — Arabic Silero min_silence 0.9s, "
+                             "endpointing min 1.0s / max 6.0s")
                     except Exception as e:
                         _log(f"[AGENT] could not switch Arabic turn detection to VAD: "
                              f"{type(e).__name__}: {e}")
@@ -610,7 +655,10 @@ def _make_agent_class():
             non-streaming, so it is wrapped in the framework's VAD StreamAdapter (the session's
             silero VAD) — the standard way to drive a chunked STT; we do not force streaming."""
             from livekit.agents import stt as stt_mod, utils
-            vad = getattr(self.session, "vad", None) or self.vad
+            # Phase 3b fix #3: feed Whisper through the dedicated WIDE-silence Arabic VAD
+            # (min_silence 0.9s) so it receives complete utterances, not 0.3s slices that
+            # transcribe to empty/garbage. Falls back to the session VAD only if it failed to build.
+            vad = self._ar_vad or getattr(self.session, "vad", None) or self.vad
             wrapped = stt_mod.StreamAdapter(stt=self._ar_stt, vad=vad)
             conn_options = self.session.conn_options.stt_conn_options
             async with wrapped.stream(conn_options=conn_options) as stream:
@@ -736,6 +784,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     ar_tts = None
     ar_greeting = None
     ar_stt = None
+    ar_vad = None
     if multi_language and "ar" in languages:
         ar_tts = _build_cartesia_ar_tts()
         if ar_tts is not None:
@@ -743,6 +792,8 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
             # Phase 3b fix: Arabic speech-IN uses Whisper (Deepgram multi romanizes Arabic).
             # Only built when the Arabic branch is actually active (Cartesia voice present).
             ar_stt = _build_whisper_ar_stt()
+            # Phase 3b fix #3: dedicated wide-silence (0.9s) VAD so Whisper gets full utterances.
+            ar_vad = _build_arabic_vad()
     if multi_language:
         primary = languages[0]
         language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
@@ -840,7 +891,8 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                                 pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
                                 language_prompt=language_prompt, languages=languages,
                                 dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
-                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt)
+                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt,
+                                ar_vad=ar_vad)
 
     room.on("disconnected", lambda *_a: done.set())
 
