@@ -298,59 +298,38 @@ def _build_cartesia_ar_tts():
         return None
 
 
-def _build_whisper_ar_stt():
-    """Per-call OpenAI Whisper STT for the Arabic branch (Phase 3b fix). Deepgram
-    language='multi' romanizes Arabic audio into nonsense English (so every turn is
-    intent=unclear); Whisper transcribes Arabic strongly, so the Arabic branch uses
-    whisper-1 with language='ar'. Whisper is non-streaming (chunked) — it is wrapped with
-    the framework's VAD StreamAdapter at use time, which is the plugin's standard handling.
+def _build_deepgram_ar_stt():
+    """Per-call Deepgram STT for the Arabic branch (Phase 3b). Uses language='ar' EXPLICITLY —
+    NOT language='multi'. 'multi' romanizes Arabic phone audio into nonsense English (the early
+    failure); the dedicated Arabic model with language='ar' transcribes Arabic properly. Whisper
+    (the previous Arabic STT) mis-heard telephone Arabic as English even with language=ar + an MSA
+    prompt, so the Arabic branch now uses Deepgram, which is streaming and handles telephony well.
 
-    Phase 3b fix #3 — make language=ar actually bite at the API call:
-      * language='ar' is stored as _opts.language and the OpenAI plugin forwards it verbatim
-        to `audio.transcriptions.create(language='ar')` (plugin stt.py _recognize_impl). Without
-        it Whisper auto-detects and, on short telephone slices, guesses English.
-      * detect_language=False — defensive: the plugin BLANKS the language whenever
-        detect_language is True, which would undo language='ar'. Force it off.
-      * prompt — a short MSA prompt biases Whisper toward Arabic so it stops emitting English
-        fragments like 'Can'/'a'. whisper-1 is the only model that honours `prompt`.
+    Arabic is supported on the nova-2 family; DEEPGRAM_AR_STT_MODEL defaults to 'nova-2-general'
+    (broadest language coverage). Streaming + interim_results + endpointing_ms=500, so turns
+    finalize incrementally from Deepgram's native endpointing — no Whisper VAD-chunking needed.
 
-    Uses the already-configured OPENAI_API_KEY (the LLM provider) — no new credential. The
-    OpenAI STT plugin is already imported here for the Whisper fallback in _build_stt, so no
-    new dependency. Returns None on failure (the Arabic call then keeps Deepgram, logged)."""
+    Reuses the SAME DEEPGRAM_API_KEY as the English path — no new credential, no new dependency.
+    Returns None on failure (the Arabic call then safely keeps the English Deepgram multi STT)."""
+    if not settings.DEEPGRAM_API_KEY:
+        _log("Arabic STT: no DEEPGRAM_API_KEY — Arabic callers keep the English Deepgram multi STT")
+        return None
     try:
-        from livekit.plugins import openai
-        _log("Arabic STT: OpenAI Whisper-1 (language=ar, detect_language=False, MSA prompt, VAD-chunked)")
-        return openai.STT(
-            model="whisper-1",
-            language="ar",            # → audio.transcriptions.create(language="ar") in the plugin
-            detect_language=False,     # never auto-detect (would blank language → English guesses)
-            prompt="هذه مكالمة هاتفية باللغة العربية الفصحى.",  # bias Whisper to Arabic, not English
-            api_key=settings.OPENAI_API_KEY,
+        from livekit.plugins import deepgram
+        model = settings.DEEPGRAM_AR_STT_MODEL or "nova-2-general"
+        _log(f"Arabic STT: Deepgram {model} language=ar (streaming, interim, endpointing=500ms) — NOT multi")
+        return deepgram.STT(
+            model=model,
+            language="ar",            # EXPLICIT Arabic — never 'multi' (multi romanizes Arabic)
+            interim_results=True,      # partials stream as the caller talks
+            punctuate=True,
+            smart_format=True,
+            no_delay=True,             # emit finals promptly, don't buffer
+            endpointing_ms=500,         # ~0.5s silence -> end-of-speech (native streaming endpointing)
+            api_key=settings.DEEPGRAM_API_KEY,
         )
     except Exception as e:
-        _log(f"Arabic STT unavailable ({type(e).__name__}: {e}); Arabic call keeps Deepgram multi")
-        return None
-
-
-def _build_arabic_vad():
-    """Dedicated Silero VAD for the Arabic Whisper branch (Phase 3b fix #3).
-
-    The Whisper StreamAdapter cuts an utterance into a chunk on every VAD END_OF_SPEECH, then
-    sends that chunk to Whisper. The session VAD's min_silence_duration is 0.3s (tuned for the
-    English path), which chops a single Arabic sentence into sub-second slices — Whisper returns
-    empty or 1-letter garbage on those. This VAD uses a WIDE 0.9s min_silence so a natural pause
-    is required before the chunk is cut, handing Whisper a COMPLETE utterance.
-
-    Arabic branch ONLY — built per Arabic call and used only inside _arabic_stt_node. The
-    session VAD used by the English path (and English turn-taking) is never touched. Returns
-    None on failure, in which case the Arabic StreamAdapter falls back to the session VAD."""
-    try:
-        from livekit.plugins import silero
-        _log("Arabic VAD: Silero min_silence_duration=0.9s, min_speech_duration=0.1s "
-             "(wide chunks so Whisper gets full Arabic utterances)")
-        return silero.VAD.load(min_silence_duration=0.9, min_speech_duration=0.1)
-    except Exception as e:
-        _log(f"Arabic VAD unavailable ({type(e).__name__}: {e}); Arabic STT falls back to session VAD")
+        _log(f"Arabic STT unavailable ({type(e).__name__}: {e}); Arabic call keeps English Deepgram multi")
         return None
 
 
@@ -513,7 +492,7 @@ def _make_agent_class():
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
                      seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
                      language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None,
-                     ar_tts=None, ar_greeting=None, ar_stt=None, ar_vad=None):
+                     ar_tts=None, ar_greeting=None, ar_stt=None):
             super().__init__(instructions=instructions)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
@@ -542,8 +521,7 @@ def _make_agent_class():
             # consumed by tts_node + on_user_turn_completed. None ar_tts -> English path.
             self._ar_tts = ar_tts
             self._ar_greeting = ar_greeting
-            self._ar_stt = ar_stt   # Phase 3b fix: Whisper STT used on the Arabic branch only
-            self._ar_vad = ar_vad   # Phase 3b fix #3: wide-silence VAD for the Arabic Whisper chunks
+            self._ar_stt = ar_stt   # Phase 3b: Deepgram language=ar STT used on the Arabic branch only
             self._arabic = False
 
         async def on_enter(self):
@@ -564,30 +542,26 @@ def _make_agent_class():
                 _log(f"[AGENT] TTS for this call = "
                      f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
                 _log(f"[AGENT] STT for this call = "
-                     f"{'whisper (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
-                # Phase 3b fix #2: on the Arabic branch ONLY, switch THIS call's turn detection
-                # from the EOU MultilingualModel to VAD endpointing. The EOU model can't get a
-                # language from the chunked, non-streaming Whisper path ("Turn detector does not
-                # support language None"), so it never fires end-of-turn and Whisper is never
-                # handed the utterance. VAD (Silero) endpointing finalizes utterances on silence
-                # so Whisper transcribes them. Live per-call change on the running session
-                # (update_options -> the active activity), NOT a session rebuild. English calls
-                # never reach this and keep the EOU turn detector untouched.
+                     f"{'deepgram-ar (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
+                # Phase 3b: on the Arabic branch ONLY, switch THIS call's turn detection from the
+                # EOU MultilingualModel to "stt" (Deepgram's native streaming endpointing). The EOU
+                # turn-detector model has NO Arabic support (no "ar" in its languages.json), so it
+                # can't decide Arabic turns. Deepgram-ar IS streaming and emits an end-of-speech on
+                # ~500ms silence (endpointing_ms=500), so "stt" mode finalizes Arabic turns from
+                # the streaming results — no Whisper VAD-chunking workaround. The endpointing
+                # bounds are reset to the English-path defaults (min 0.8s / max 4.0s) since the
+                # Whisper batch-latency widening (1.0/6.0) is no longer needed. Live per-call change
+                # on the running session; English calls never reach this and keep EOU untouched.
                 if self._arabic:
                     try:
-                        # Phase 3b fix #3: widen the endpointing window too. Whisper is batch +
-                        # chunked behind the wide 0.9s VAD, so its FINAL transcript arrives later
-                        # than a streaming STT's; min 1.0s / max 6.0s gives the turn time to pick
-                        # up the full utterance instead of committing an empty turn. Per-call
-                        # session only — the English path's session is built fresh and untouched.
-                        self.session.update_options(turn_detection="vad",
-                                                    min_endpointing_delay=1.0,
-                                                    max_endpointing_delay=6.0)
-                        _log("[AGENT] Arabic branch: turn detection = VAD endpointing "
-                             "(EOU model OFF for this call) — Arabic Silero min_silence 0.9s, "
-                             "endpointing min 1.0s / max 6.0s")
+                        self.session.update_options(turn_detection="stt",
+                                                    min_endpointing_delay=0.8,
+                                                    max_endpointing_delay=4.0)
+                        _log("[AGENT] Arabic branch: turn detection = STT endpointing "
+                             "(Deepgram native ~500ms; EOU model OFF — no Arabic support) — "
+                             "endpointing min 0.8s / max 4.0s")
                     except Exception as e:
-                        _log(f"[AGENT] could not switch Arabic turn detection to VAD: "
+                        _log(f"[AGENT] could not switch Arabic turn detection to STT: "
                              f"{type(e).__name__}: {e}")
                 # session.say() with a fixed string is more reliable/instant than
                 # generate_reply() for a known greeting. For outbound reminders this is the
@@ -652,10 +626,10 @@ def _make_agent_class():
                 _log(f"[AGENT] no valid DTMF — language LOCKED = {primary} (default)")
 
         async def stt_node(self, audio, model_settings):
-            """Per-call STT routing (Phase 3b fix). Arabic branch -> OpenAI Whisper (strong
-            Arabic, language=ar); every other call -> the framework default, i.e. the session's
+            """Per-call STT routing (Phase 3b). Arabic branch -> Deepgram language='ar' (dedicated
+            Arabic, streaming); every other call -> the framework default, i.e. the session's
             Deepgram language='multi' STT exactly as today. The English path is completely
-            untouched (self._arabic is False), so Whisper is NEVER used on a non-Arabic call."""
+            untouched (self._arabic is False), so the Arabic STT is NEVER used on a non-Arabic call."""
             if self._arabic and self._ar_stt is not None:
                 async for ev in self._arabic_stt_node(audio, model_settings):
                     yield ev
@@ -664,17 +638,13 @@ def _make_agent_class():
                 yield ev
 
         async def _arabic_stt_node(self, audio, model_settings):
-            """Transcribe the audio stream with the per-call Whisper STT. Whisper is
-            non-streaming, so it is wrapped in the framework's VAD StreamAdapter (the session's
-            silero VAD) — the standard way to drive a chunked STT; we do not force streaming."""
-            from livekit.agents import stt as stt_mod, utils
-            # Phase 3b fix #3: feed Whisper through the dedicated WIDE-silence Arabic VAD
-            # (min_silence 0.9s) so it receives complete utterances, not 0.3s slices that
-            # transcribe to empty/garbage. Falls back to the session VAD only if it failed to build.
-            vad = self._ar_vad or getattr(self.session, "vad", None) or self.vad
-            wrapped = stt_mod.StreamAdapter(stt=self._ar_stt, vad=vad)
+            """Stream the audio to the per-call Deepgram Arabic STT (language='ar'). Deepgram is a
+            STREAMING STT, so it is driven directly — no VAD StreamAdapter / Whisper chunking. Turns
+            finalize from Deepgram's native streaming endpointing (endpointing_ms=500). Mirrors the
+            framework's default streaming stt_node loop, bound to self._ar_stt."""
+            from livekit.agents import utils
             conn_options = self.session.conn_options.stt_conn_options
-            async with wrapped.stream(conn_options=conn_options) as stream:
+            async with self._ar_stt.stream(conn_options=conn_options) as stream:
                 async def _forward():
                     async for frame in audio:
                         stream.push_frame(frame)
@@ -797,16 +767,14 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     ar_tts = None
     ar_greeting = None
     ar_stt = None
-    ar_vad = None
     if multi_language and "ar" in languages:
         ar_tts = _build_cartesia_ar_tts()
         if ar_tts is not None:
             ar_greeting = _arabic_greeting((behavior_config or {}).get("business_name"))
-            # Phase 3b fix: Arabic speech-IN uses Whisper (Deepgram multi romanizes Arabic).
-            # Only built when the Arabic branch is actually active (Cartesia voice present).
-            ar_stt = _build_whisper_ar_stt()
-            # Phase 3b fix #3: dedicated wide-silence (0.9s) VAD so Whisper gets full utterances.
-            ar_vad = _build_arabic_vad()
+            # Phase 3b: Arabic speech-IN uses Deepgram language='ar' (NOT multi, which romanizes
+            # Arabic). Streaming, so no VAD-chunking. Only built when the Arabic branch is actually
+            # active (Cartesia voice present).
+            ar_stt = _build_deepgram_ar_stt()
     if multi_language:
         primary = languages[0]
         language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
@@ -909,8 +877,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                                 pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
                                 language_prompt=language_prompt, languages=languages,
                                 dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
-                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt,
-                                ar_vad=ar_vad)
+                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt)
 
     room.on("disconnected", lambda *_a: done.set())
 
