@@ -412,6 +412,15 @@ def _wire_session_logging(session) -> None:
         final = getattr(ev, "is_final", False)
         text = getattr(ev, "transcript", "")
         logger.info("📝 STT %s: %r", "FINAL" if final else "interim", text)
+        # [AR-DIAG] TEMPORARY (tagged for easy removal): when the ACTIVE agent is the Arabic one,
+        # surface the RAW transcript + Deepgram's detected language so we can confirm audio is
+        # reaching the Arabic STT and see exactly what Nova-3 returns. This fires from the DEFAULT
+        # pipeline (no node override). NOTE: per-result confidence and per-frame audio format are
+        # NOT exposed on this session event — they required the custom node we removed; the
+        # transcript firing at all is now the proof that audio reaches the Arabic STT.
+        if getattr(getattr(session, "current_agent", None), "_arabic", False):
+            _log(f"[AR-DIAG] raw transcript ({'final' if final else 'interim'}) = {text!r} "
+                 f"detected_language={getattr(ev, 'language', None)!r}")
 
     @session.on("conversation_item_added")
     def _on_item(ev):
@@ -492,11 +501,23 @@ def _make_agent_class():
     from livekit.agents import Agent
 
     class ClinicAgent(Agent):
+        """ONE agent class for BOTH languages — the business logic (GuardrailBrain, intent,
+        DB functions, tenant scoping, on_user_turn_completed) is identical and never forked.
+        Two instances are built from the SAME construction path (see _serve), differing ONLY in:
+        the STT/TTS/turn_detection passed to Agent (via **agent_kwargs), the greeting string, and
+        the `arabic` flag (which appends the MSA output instruction). The English instance passes
+        NO components, so it uses the session's English Deepgram STT / aura TTS / EOU turn
+        detection exactly as before. The Arabic instance passes Deepgram nova-3 (ar) STT, Cartesia
+        TTS, and turn_detection='stt' — all consumed by the framework's DEFAULT stt/tts nodes (no
+        custom node overrides), so audio flows the same proven path as English."""
+
         def __init__(self, *, instructions, on_state=None, on_end=None, greeting=None,
                      seed_entities=None, pending_intent=None, tenant_id=None, niche=None,
                      language_prompt=None, languages=None, dtmf_event=None, dtmf_holder=None,
-                     ar_tts=None, ar_greeting=None, ar_stt=None):
-            super().__init__(instructions=instructions)
+                     arabic=False, call_language=None, make_arabic_agent=None, **agent_kwargs):
+            # agent_kwargs carries the Arabic instance's stt/tts/turn_detection/endpointing — passed
+            # to Agent the NORMAL way. Empty for the English instance (it uses session components).
+            super().__init__(instructions=instructions, **agent_kwargs)
             # Outbound reminder calls seed the brain with the appointment context
             # (appointment_id, phone) and a pending confirm intent so a bare "yes"
             # confirms the right appointment and reschedule/cancel target it directly.
@@ -518,61 +539,51 @@ def _make_agent_class():
             self._languages = languages or ["en"]
             self._dtmf_event = dtmf_event
             self._dtmf_holder = dtmf_holder if dtmf_holder is not None else {}
-            self._call_language = None   # set by _select_language (Phase 3a)
-            # Phase 3b: Arabic path is gated on BOTH the selected language == "ar" AND an
-            # available Arabic TTS. self._arabic is the single decided flag (set in on_enter)
-            # consumed by tts_node + on_user_turn_completed. None ar_tts -> English path.
-            self._ar_tts = ar_tts
-            self._ar_greeting = ar_greeting
-            self._ar_stt = ar_stt   # Phase 3b: Deepgram language=ar STT used on the Arabic branch only
-            self._arabic = False
+            # call_language is pre-locked ("ar") for the Arabic instance; None for the selector
+            # (set by _select_language). _arabic marks the Arabic instance (MSA output + logs).
+            self._call_language = call_language
+            self._arabic = arabic
+            # Factory to build the clean Arabic agent; only the selector holds it. None when the
+            # tenant offers no Arabic (no Cartesia AR voice) -> the call stays English.
+            self._make_arabic_agent = make_arabic_agent
 
         async def on_enter(self):
             # Brief pause so the agent's audio track is fully published/subscribed
             # before we speak — otherwise the first word(s) get cut.
             try:
                 await asyncio.sleep(0.3)
-                # Phase 3a: offer the keypad language menu BEFORE the greeting (no-op for
-                # single-language tenants / reminders). Stores + logs the chosen language.
-                await self._select_language()
-                # Phase 3b: decide the Arabic branch — gated on the selected language being
-                # "ar" AND an available Arabic TTS. When false, EVERYTHING below is today's
-                # English path byte-for-byte (Deepgram TTS, English greeting/generation).
-                self._arabic = (self._call_language == "ar") and (self._ar_tts is not None)
-                if self._call_language == "ar" and self._ar_tts is None:
-                    _log("[AGENT] Arabic selected but no Arabic TTS configured "
-                         "(CARTESIA_AR_VOICE unset) — using English Deepgram + English generation")
-                _log(f"[AGENT] TTS for this call = "
-                     f"{'cartesia (ar)' if self._arabic else 'deepgram (' + (self._call_language or 'en') + ')'}")
-                _log(f"[AGENT] STT for this call = "
-                     f"{'deepgram-nova3 (ar)' if (self._arabic and self._ar_stt is not None) else 'deepgram (multi)'}")
-                # Phase 3b: on the Arabic branch ONLY, switch THIS call's turn detection from the
-                # EOU MultilingualModel to "stt" (Deepgram's native streaming endpointing). The EOU
-                # turn-detector model has NO Arabic support (no "ar" in its languages.json), so it
-                # can't decide Arabic turns. Deepgram-ar IS streaming and emits an end-of-speech on
-                # ~500ms silence (endpointing_ms=500), so "stt" mode finalizes Arabic turns from
-                # the streaming results — no Whisper VAD-chunking workaround. The endpointing
-                # bounds are reset to the English-path defaults (min 0.8s / max 4.0s) since the
-                # Whisper batch-latency widening (1.0/6.0) is no longer needed. Live per-call change
-                # on the running session; English calls never reach this and keep EOU untouched.
+                # Phase 3a: the SELECTOR instance offers the keypad language menu BEFORE greeting
+                # (no-op for single-language tenants / reminders). The Arabic instance is already
+                # locked (call_language="ar") and skips selection entirely.
+                if not self._arabic:
+                    await self._select_language()
+                # Phase 3b DISPATCH: if the caller locked Arabic and an Arabic agent is available,
+                # HAND OFF to the cleanly-built Arabic agent (its own STT/TTS via the DEFAULT
+                # pipeline) and let IT greet + run the call. update_agent rebuilds the audio
+                # recognition with the Arabic STT, so audio finally reaches Deepgram nova-3 (ar).
+                if (not self._arabic and self._call_language == "ar"
+                        and self._make_arabic_agent is not None):
+                    _log("[AGENT] language=ar -> dispatching to the clean Arabic agent "
+                         "(default STT/TTS pipeline)")
+                    self.session.update_agent(self._make_arabic_agent())
+                    return   # the Arabic agent's on_enter speaks the MSA greeting + runs the call
+                if (not self._arabic and self._call_language == "ar"
+                        and self._make_arabic_agent is None):
+                    _log("[AGENT] Arabic selected but no Arabic agent available "
+                         "(CARTESIA_AR_VOICE unset) — staying on the English path")
+                # Greeting: MSA for the Arabic instance, English otherwise. Both go through the
+                # framework's DEFAULT tts node (session aura for English, the agent's Cartesia for
+                # Arabic) — no per-call node override.
                 if self._arabic:
-                    try:
-                        self.session.update_options(turn_detection="stt",
-                                                    min_endpointing_delay=0.8,
-                                                    max_endpointing_delay=4.0)
-                        _log("[AGENT] Arabic branch: turn detection = STT endpointing "
-                             "(Deepgram native ~500ms; EOU model OFF — no Arabic support) — "
-                             "endpointing min 0.8s / max 4.0s")
-                    except Exception as e:
-                        _log(f"[AGENT] could not switch Arabic turn detection to STT: "
-                             f"{type(e).__name__}: {e}")
-                # session.say() with a fixed string is more reliable/instant than
-                # generate_reply() for a known greeting. For outbound reminders this is the
-                # reminder script; for inbound it's the standard greeting (English, or MSA on
-                # the Arabic branch). tts_node routes the audio to the right engine.
-                greeting = self._ar_greeting if (self._arabic and self._ar_greeting) else self._greeting
+                    _log("[AR-DIAG] Arabic agent ACTIVE — STT=deepgram nova-3 (ar), TTS=cartesia "
+                         "via the DEFAULT pipeline; audio now flows the same path as English")
+                    _log("[AGENT] STT for this call = deepgram-nova3 (ar) | TTS = cartesia (ar) | "
+                         "turn detection = stt (Deepgram native ~500ms; EOU OFF — no Arabic)")
+                else:
+                    _log(f"[AGENT] STT for this call = deepgram (multi) | TTS = deepgram (en) | "
+                         f"language = {self._call_language or 'en'}")
                 _log("greeting: speaking")
-                await self.session.say(greeting, allow_interruptions=True)
+                await self.session.say(self._greeting, allow_interruptions=True)
                 _log("greeting: done")
             except Exception as e:
                 _log(f"greeting error: {type(e).__name__}: {e}")
@@ -628,103 +639,13 @@ def _make_agent_class():
                 self._call_language = primary
                 _log(f"[AGENT] no valid DTMF — language LOCKED = {primary} (default)")
 
-        async def stt_node(self, audio, model_settings):
-            """Per-call STT routing (Phase 3b). Arabic branch -> Deepgram language='ar' (dedicated
-            Arabic, streaming); every other call -> the framework default, i.e. the session's
-            Deepgram language='multi' STT exactly as today. The English path is completely
-            untouched (self._arabic is False), so the Arabic STT is NEVER used on a non-Arabic call."""
-            if self._arabic and self._ar_stt is not None:
-                async for ev in self._arabic_stt_node(audio, model_settings):
-                    yield ev
-                return
-            async for ev in Agent.default.stt_node(self, audio, model_settings):
-                yield ev
-
-        async def _arabic_stt_node(self, audio, model_settings):
-            """Stream the audio to the per-call Deepgram Arabic STT (Nova-3, language='ar'). Deepgram
-            is a STREAMING STT, so it is driven directly — no VAD StreamAdapter / chunking. Turns
-            finalize from Deepgram's native streaming endpointing (endpointing_ms=500). Mirrors the
-            framework's default streaming stt_node loop, bound to self._ar_stt.
-
-            [AR-DIAG] TEMPORARY diagnostics (all tagged [AR-DIAG] for easy removal later): logs the
-            audio format the STT actually receives (1st frame) and the RAW transcript + Deepgram's
-            detected language/confidence on every interim & final, so we can see exactly what the
-            model gets and returns instead of guessing."""
-            from livekit.agents import stt as stt_mod, utils
-            conn_options = self.session.conn_options.stt_conn_options
-            audio_logged = {"done": False}
-            async with self._ar_stt.stream(conn_options=conn_options) as stream:
-                async def _forward():
-                    async for frame in audio:
-                        # [AR-DIAG] log the real audio format ENTERING the STT, once. sample_rate=8000
-                        # means raw telephony (8kHz) is reaching the model; encoding is PCM16 because
-                        # LiveKit has already decoded the SIP μ-law to PCM before stt_node sees it.
-                        if not audio_logged["done"]:
-                            audio_logged["done"] = True
-                            _log(f"[AR-DIAG] STT input audio: sample_rate="
-                                 f"{getattr(frame, 'sample_rate', '?')} "
-                                 f"channels={getattr(frame, 'num_channels', '?')} "
-                                 f"samples_per_channel={getattr(frame, 'samples_per_channel', '?')} "
-                                 f"encoding=pcm16(post-decode)")
-                        stream.push_frame(frame)
-                    stream.end_input()
-                forward_task = asyncio.create_task(_forward())
-                try:
-                    async for ev in stream:
-                        self._ar_diag_result(ev, stt_mod)   # [AR-DIAG] raw transcript + lang/conf
-                        yield ev
-                finally:
-                    await utils.aio.cancel_and_wait(forward_task)
-
-        @staticmethod
-        def _ar_diag_result(ev, stt_mod):
-            """[AR-DIAG] TEMPORARY: log Deepgram's raw transcript + detected language/confidence for
-            each interim/final result on the Arabic branch. Never raises into the STT loop."""
-            try:
-                t = getattr(ev, "type", None)
-                if t not in (stt_mod.SpeechEventType.INTERIM_TRANSCRIPT,
-                             stt_mod.SpeechEventType.FINAL_TRANSCRIPT):
-                    return
-                kind = "final" if t == stt_mod.SpeechEventType.FINAL_TRANSCRIPT else "interim"
-                alts = getattr(ev, "alternatives", None) or []
-                if not alts:
-                    _log(f"[AR-DIAG] raw transcript ({kind}) = <no alternatives>")
-                    return
-                a = alts[0]
-                _log(f"[AR-DIAG] Deepgram detected_language={getattr(a, 'language', None)!r} "
-                     f"confidence={getattr(a, 'confidence', None)}")
-                _log(f"[AR-DIAG] raw transcript ({kind}) = {getattr(a, 'text', '')!r}")
-            except Exception as e:
-                _log(f"[AR-DIAG] diag error: {type(e).__name__}: {e}")
-
-        async def tts_node(self, text, model_settings):
-            """Per-call TTS routing (Phase 3b). Arabic branch -> Cartesia (MSA); every other
-            call -> the framework default, i.e. the session's Deepgram TTS exactly as today.
-            The English path is completely untouched (self._arabic is False)."""
-            if self._arabic and self._ar_tts is not None:
-                async for frame in self._arabic_tts_node(text, model_settings):
-                    yield frame
-                return
-            async for frame in Agent.default.tts_node(self, text, model_settings):
-                yield frame
-
-        async def _arabic_tts_node(self, text, model_settings):
-            """Synthesize the text stream with the per-call Cartesia Arabic TTS. Mirrors the
-            framework's default streaming loop, but bound to self._ar_tts (Cartesia streams
-            natively, so no StreamAdapter is needed)."""
-            from livekit.agents import utils
-            conn_options = self.session.conn_options.tts_conn_options
-            async with self._ar_tts.stream(conn_options=conn_options) as stream:
-                async def _forward():
-                    async for chunk in text:
-                        stream.push_text(chunk)
-                    stream.end_input()
-                forward_task = asyncio.create_task(_forward())
-                try:
-                    async for ev in stream:
-                        yield ev.frame
-                finally:
-                    await utils.aio.cancel_and_wait(forward_task)
+        # NOTE: there are deliberately NO stt_node / tts_node overrides. The previous per-call
+        # override checked self._arabic, but that flag was only set in on_enter AFTER the activity
+        # had already bound its STT (when the flag was still False) — so audio never reached the
+        # Arabic STT and the override silently swallowed it. The Arabic agent now carries its STT/
+        # TTS as real Agent components, consumed by the framework's DEFAULT nodes. [AR-DIAG] raw
+        # transcript + detected language are logged from the session's user_input_transcribed event
+        # (see _wire_session_logging), which fires from that same default pipeline.
 
         async def on_user_turn_completed(self, turn_ctx, new_message):
             """Guardrail: classify -> fetch real data -> inject a strict instruction
@@ -913,12 +834,33 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
                 greeting = f"Hello {name.split()[0]}, " + greeting[0].lower() + greeting[1:]
             _log(f"recognized returning caller {name!r} ({phone})")
 
-    agent = _make_agent_class()(instructions=instructions, on_state=on_state, on_end=on_end,
-                                greeting=greeting, seed_entities=seed_entities,
-                                pending_intent=pending_intent, tenant_id=tenant_id, niche=niche,
-                                language_prompt=language_prompt, languages=languages,
-                                dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
-                                ar_tts=ar_tts, ar_greeting=ar_greeting, ar_stt=ar_stt)
+    # Both agents are built from the SAME class + SAME shared config (instructions, guardrail
+    # seed, tenant, niche, callbacks) — the business logic is never forked. They differ ONLY in
+    # components/greeting/arabic flag. `common` is the shared construction kwargs.
+    AgentClass = _make_agent_class()
+    common = dict(instructions=instructions, on_state=on_state, on_end=on_end,
+                  seed_entities=seed_entities, pending_intent=pending_intent,
+                  tenant_id=tenant_id, niche=niche)
+
+    # The clean Arabic agent: built the STANDARD way with its STT/TTS/turn_detection passed to
+    # Agent (consumed by the DEFAULT nodes). Only available when this tenant has a working Arabic
+    # STT + TTS + greeting; otherwise the selector keeps the call English.
+    arabic_available = (ar_stt is not None and ar_tts is not None and ar_greeting is not None)
+
+    def make_arabic_agent():
+        return AgentClass(greeting=ar_greeting, arabic=True, call_language="ar",
+                          stt=ar_stt, tts=ar_tts, turn_detection="stt",
+                          min_endpointing_delay=0.8, max_endpointing_delay=4.0,
+                          **common)
+
+    # The initial (English/selector) agent: NO component overrides -> it uses the session's English
+    # Deepgram multi STT, aura TTS, and EOU turn detection exactly as before. It runs the DTMF
+    # language menu and, on a press-2 lock, hands off to make_arabic_agent().
+    agent = AgentClass(greeting=greeting, arabic=False,
+                       language_prompt=language_prompt, languages=languages,
+                       dtmf_event=dtmf_event, dtmf_holder=dtmf_holder,
+                       make_arabic_agent=(make_arabic_agent if arabic_available else None),
+                       **common)
 
     room.on("disconnected", lambda *_a: done.set())
 
