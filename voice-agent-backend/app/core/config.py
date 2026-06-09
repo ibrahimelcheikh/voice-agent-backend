@@ -29,11 +29,26 @@ class Settings(BaseSettings):
     # Deepgram aura is lowest-latency but ENGLISH-ONLY; use cartesia for multilingual.
     TTS_PROVIDER: str = "deepgram"
     DEEPGRAM_STT_MODEL: str = "nova-2-general"
-    # Arabic STT (Phase 3b) — Deepgram with language="ar" (NOT multi). Nova-3 has a dedicated,
-    # production-grade Arabic model (17 dialect variants incl. Lebanese, streaming-supported);
-    # Nova-3 'multi' EXCLUDES Arabic, so monolingual language="ar" on nova-3 is the correct path.
+    # Arabic STT (Phase 3b) — Deepgram with a monolingual Arabic language code (NOT multi). Nova-3
+    # has a dedicated, production-grade Arabic model (17 dialect variants incl. Lebanese, streaming-
+    # supported); Nova-3 'multi' EXCLUDES Arabic, so a monolingual code on nova-3 is the correct path.
     # ("nova-3" and "nova-3-general" are the same model.)
     DEEPGRAM_AR_STT_MODEL: str = "nova-3"
+    # Phase 3b polish — Lebanese dialect. ar-LB is Nova-3's Lebanese (Levantine) variant; far more
+    # accurate on Lebanese phone Arabic than bare "ar". Fall back to "ar" if ar-LB underperforms.
+    DEEPGRAM_AR_LANGUAGE: str = "ar-LB"
+    # Phase 3b polish — Nova-3 Keyterm Prompting: boost the menu's Arabic item names (comma-separated)
+    # so the STT recognises them. Supported across all Arabic dialects incl. ar-LB (NOT with multi).
+    # STATIC default = Beirut Bites demo list; a tenant can override via its config 'ar_keyterms'.
+    # NOTE: the DB stores menu names in ENGLISH, so Arabic keyterms can't be auto-derived from it —
+    # per-tenant Arabic keyterms must be supplied in tenant config (or extend this default).
+    DEEPGRAM_AR_KEYTERMS: str = "فلافل,حمص,شاورما دجاج,شاورما لحمة,عصير ليمون,كابتشينو,لاتيه,برغر"
+    # Phase 3b polish — Arabic turn-taking. Wider than English so brief mid-utterance pauses don't
+    # cut the caller off (the right trade for ordering: a little latency vs. not getting interrupted).
+    # endpointing_ms = Deepgram silence before end-of-speech; the delays bound the agent's turn commit.
+    DEEPGRAM_AR_ENDPOINTING_MS: int = 1000
+    AR_MIN_ENDPOINTING_DELAY: float = 1.3
+    AR_MAX_ENDPOINTING_DELAY: float = 5.0
     DEEPGRAM_TTS_MODEL: str = "aura-asteria-en"
     CARTESIA_TTS_MODEL: str = "sonic-2"
     CARTESIA_VOICE: str = ""  # optional Cartesia voice id; blank = plugin default

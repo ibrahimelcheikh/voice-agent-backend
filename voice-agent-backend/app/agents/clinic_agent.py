@@ -298,39 +298,50 @@ def _build_cartesia_ar_tts():
         return None
 
 
-def _build_deepgram_ar_stt():
-    """Per-call Deepgram STT for the Arabic branch (Phase 3b). Uses Deepgram NOVA-3 with
-    language='ar' EXPLICITLY (monolingual Arabic) — NOT 'multi'. Two reasons:
-      * Nova-3 has a dedicated, production-grade Arabic model (17 regional dialect variants incl.
-        Lebanese), streaming-supported and materially more accurate than nova-2 on phone Arabic.
-      * Nova-3's 'multi' (multilingual) set EXCLUDES Arabic (it covers en/es/fr/de/hi/ru/pt/ja/
-        it/nl only), so language='multi' would NOT transcribe Arabic — monolingual 'ar' is required.
-    Earlier attempts (Whisper language=ar, and nova-2-general language=ar) mis-heard telephone
-    Arabic as English; Nova-3 Arabic is the current GA model for this.
+def _build_deepgram_ar_stt(keyterms=None):
+    """Per-call Deepgram STT for the Arabic branch (Phase 3b). Uses Deepgram NOVA-3 with a
+    monolingual LEBANESE Arabic code (ar-LB by default) — NOT 'multi'. Reasons:
+      * Nova-3 has a dedicated, production-grade Arabic model (17 regional dialect variants);
+        ar-LB is its Lebanese (Levantine) variant — far better on Lebanese phone Arabic than 'ar'.
+      * Nova-3's 'multi' set EXCLUDES Arabic, so a monolingual code is required (and 'multi' also
+        disables Keyterm Prompting). The full code (e.g. 'ar-LB') is sent to Deepgram verbatim.
 
-    DEEPGRAM_AR_STT_MODEL defaults to 'nova-3'. Streaming + interim_results + endpointing_ms=500,
-    so turns finalize incrementally from Deepgram's native endpointing — no VAD-chunking needed.
+    Phase 3b polish adds:
+      * Keyterm Prompting (Nova-3 only; the plugin param is `keyterm`, NOT `keywords`): boosts the
+        tenant's Arabic menu item names. `keyterms` arg = the tenant's list (from its config) or, if
+        None, the DEEPGRAM_AR_KEYTERMS default. Supported across Arabic dialects incl. ar-LB.
+      * Wider endpointing_ms (default 1000ms) so brief mid-utterance pauses don't end the turn.
 
-    Reuses the SAME DEEPGRAM_API_KEY as the English path — no new credential, no new dependency.
-    Returns None on failure (the Arabic call then safely keeps the English Deepgram multi STT)."""
+    Reuses the SAME DEEPGRAM_API_KEY as the English path. Returns None on failure (the Arabic call
+    then safely keeps the English Deepgram multi STT)."""
     if not settings.DEEPGRAM_API_KEY:
         _log("Arabic STT: no DEEPGRAM_API_KEY — Arabic callers keep the English Deepgram multi STT")
         return None
     try:
         from livekit.plugins import deepgram
         model = settings.DEEPGRAM_AR_STT_MODEL or "nova-3"
-        _log(f"Arabic STT: Deepgram model={model} language=ar (Nova-3 monolingual Arabic, streaming, "
-             f"interim, endpointing=500ms) — NOT multi (Nova-3 multi excludes Arabic)")
-        return deepgram.STT(
+        language = settings.DEEPGRAM_AR_LANGUAGE or "ar-LB"
+        endpointing_ms = settings.DEEPGRAM_AR_ENDPOINTING_MS or 1000
+        # keyterms: tenant override (list) OR the configured default (comma-separated string).
+        terms = keyterms if keyterms is not None else [
+            t.strip() for t in (settings.DEEPGRAM_AR_KEYTERMS or "").split(",") if t.strip()]
+        _log(f"Arabic STT: Deepgram model={model} language={language} (Nova-3 Lebanese Arabic, "
+             f"streaming, endpointing={endpointing_ms}ms, keyterms={len(terms)}) — NOT multi")
+        kwargs = dict(
             model=model,
-            language="ar",            # EXPLICIT monolingual Arabic — never 'multi'
-            interim_results=True,      # partials stream as the caller talks
+            language=language,         # full Lebanese code (ar-LB) sent verbatim to Deepgram
+            interim_results=True,       # partials stream as the caller talks
             punctuate=True,
             smart_format=True,
-            no_delay=True,             # emit finals promptly, don't buffer
-            endpointing_ms=500,         # ~0.5s silence -> end-of-speech (native streaming endpointing)
+            no_delay=True,              # emit finals promptly, don't buffer
+            endpointing_ms=endpointing_ms,  # silence before end-of-speech (wider so pauses don't cut)
             api_key=settings.DEEPGRAM_API_KEY,
         )
+        # Nova-3 Keyterm Prompting. MUST be `keyterm` (a list) on Nova-3 — `keywords` raises on
+        # Nova-3 (it's the older-model feature). Compatible with monolingual ar-LB (not with multi).
+        if terms:
+            kwargs["keyterm"] = terms
+        return deepgram.STT(**kwargs)
     except Exception as e:
         _log(f"Arabic STT unavailable ({type(e).__name__}: {e}); Arabic call keeps English Deepgram multi")
         return None
@@ -575,10 +586,14 @@ def _make_agent_class():
                 # framework's DEFAULT tts node (session aura for English, the agent's Cartesia for
                 # Arabic) — no per-call node override.
                 if self._arabic:
-                    _log("[AR-DIAG] Arabic agent ACTIVE — STT=deepgram nova-3 (ar), TTS=cartesia "
-                         "via the DEFAULT pipeline; audio now flows the same path as English")
-                    _log("[AGENT] STT for this call = deepgram-nova3 (ar) | TTS = cartesia (ar) | "
-                         "turn detection = stt (Deepgram native ~500ms; EOU OFF — no Arabic)")
+                    _log(f"[AR-DIAG] Arabic agent ACTIVE — STT=deepgram nova-3 "
+                         f"({settings.DEEPGRAM_AR_LANGUAGE}), TTS=cartesia via the DEFAULT pipeline; "
+                         f"audio now flows the same path as English")
+                    _log(f"[AGENT] STT for this call = deepgram-nova3 ({settings.DEEPGRAM_AR_LANGUAGE}) | "
+                         f"TTS = cartesia (ar) | turn detection = stt (endpointing "
+                         f"{settings.DEEPGRAM_AR_ENDPOINTING_MS}ms, commit min "
+                         f"{settings.AR_MIN_ENDPOINTING_DELAY}s / max {settings.AR_MAX_ENDPOINTING_DELAY}s; "
+                         f"EOU OFF — no Arabic)")
                 else:
                     _log(f"[AGENT] STT for this call = deepgram (multi) | TTS = deepgram (en) | "
                          f"language = {self._call_language or 'en'}")
@@ -733,10 +748,13 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
         ar_tts = _build_cartesia_ar_tts()
         if ar_tts is not None:
             ar_greeting = _arabic_greeting((behavior_config or {}).get("business_name"))
-            # Phase 3b: Arabic speech-IN uses Deepgram language='ar' (NOT multi, which romanizes
-            # Arabic). Streaming, so no VAD-chunking. Only built when the Arabic branch is actually
-            # active (Cartesia voice present).
-            ar_stt = _build_deepgram_ar_stt()
+            # Phase 3b: Arabic speech-IN uses Deepgram nova-3 language=ar-LB (Lebanese; NOT multi).
+            # Keyterms boost the tenant's Arabic menu names — use the tenant's own list if its config
+            # provides one ('ar_keyterms', list or comma-string), else the DEEPGRAM_AR_KEYTERMS default.
+            _ar_kt = (behavior_config or {}).get("ar_keyterms")
+            if isinstance(_ar_kt, str):
+                _ar_kt = [t.strip() for t in _ar_kt.split(",") if t.strip()]
+            ar_stt = _build_deepgram_ar_stt(keyterms=_ar_kt)
     if multi_language:
         primary = languages[0]
         language_prompt = _build_language_prompt((behavior_config or {}).get("business_name"),
@@ -848,9 +866,12 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     arabic_available = (ar_stt is not None and ar_tts is not None and ar_greeting is not None)
 
     def make_arabic_agent():
+        # Phase 3b polish — wider endpointing delays than English so the caller can pause briefly
+        # mid-utterance without the agent jumping in (configurable via AR_*_ENDPOINTING_DELAY).
         return AgentClass(greeting=ar_greeting, arabic=True, call_language="ar",
                           stt=ar_stt, tts=ar_tts, turn_detection="stt",
-                          min_endpointing_delay=0.8, max_endpointing_delay=4.0,
+                          min_endpointing_delay=settings.AR_MIN_ENDPOINTING_DELAY,
+                          max_endpointing_delay=settings.AR_MAX_ENDPOINTING_DELAY,
                           **common)
 
     # The initial (English/selector) agent: NO component overrides -> it uses the session's English
