@@ -74,6 +74,13 @@ async def startup():
     # tenant and assign all pre-existing rows to it. No-op on a fresh DB (the seed already
     # scopes every row) and on an already-migrated DB.
     await backfill_default_tenant()
+    # AtlasPrimeX demo fleet (Phase 4) — additive & idempotent; never touches the existing
+    # clinic. Seeds the operator + merchant logins and demo data the two apps show.
+    try:
+        from app.db.seed_atlasprimex import seed_atlasprimex_demo
+        await seed_atlasprimex_demo()
+    except Exception as e:
+        print(f"[seed] AtlasPrimeX demo seed skipped: {type(e).__name__}: {e}")
     # NOTE: We deliberately DO NOT reconfigure the Twilio number's voice webhook on boot.
     # Inbound calls are routed via a Twilio Elastic SIP Trunk (Origination URI ->
     # <proj>.sip.livekit.cloud) into the LiveKit inbound SIP trunk + dispatch rule, which
@@ -173,6 +180,11 @@ app.include_router(orders.router, prefix="/orders", tags=["Restaurant — Orders
 app.include_router(leads.router, prefix="/leads", tags=["Lead Capture"])
 app.include_router(demo.router, prefix="/demo", tags=["Demo"])
 app.include_router(reminders.router, prefix="/reminders", tags=["Reminders"])
+
+# AtlasPrimeX versioned API (Phase 4) — serves the merchant app + PrimeOps console.
+# Additive: existing routes above are unchanged; the live agent path is untouched.
+from app.api import v1 as api_v1  # noqa: E402
+app.include_router(api_v1.router, prefix="/api/v1")
 
 
 @app.get("/")

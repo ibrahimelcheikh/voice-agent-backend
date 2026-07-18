@@ -85,6 +85,9 @@ class Tenant(Base):
     timezone = Column(String, default="Asia/Beirut")
     # First line the agent speaks on an inbound call for this tenant.
     greeting_message = Column(Text, nullable=True)
+    # Greeting spoken when the clinic is CLOSED (outside hours / holiday / temp closure).
+    # Surfaced in load_tenant_config; NULL keeps the existing single-greeting behavior.
+    closed_greeting = Column(Text, nullable=True)
     # FAQ knowledge the agent may state: hours, services, pricing, locations, policies.
     # Free-form JSON so each niche can shape it without a schema change.
     knowledge_base = Column(JSON, default=dict)
@@ -106,6 +109,9 @@ class User(Base):
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
     is_active = Column(Boolean, default=True)
+    # Human-readable job title shown in the PrimeOps Users screen (e.g. "Support Lead",
+    # "Onboarding"). Independent of the auth `role`. Operators have tenant_id = NULL.
+    title = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 class BehaviorConfig(Base):
@@ -266,6 +272,11 @@ class Service(Base):
     duration_minutes = Column(Integer, default=30)
     price = Column(Integer, default=0)              # cents
     description = Column(Text, nullable=True)
+    # Merchant-dashboard extras (additive). `category` groups services; `details` holds the
+    # rich fields the merchant app shows (about / prep / after / pricing tiers, EN+AR).
+    # The voice agent only reads name/price/duration, so these never affect it.
+    category = Column(String, nullable=True)
+    details = Column(JSON, default=dict)
     created_at = Column(DateTime, server_default=func.now())
     clinic = relationship("Clinic", foreign_keys=[clinic_id])
 
@@ -425,6 +436,8 @@ class Lead(Base):
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
+    # Optional email — used by the website "Book a demo" lead form.
+    email = Column(String, nullable=True)
     # What the caller is interested in: property type (real estate), vehicle interest
     # (automotive), or service needed (services). One column serves all three.
     lead_type = Column(String, nullable=True)
@@ -432,5 +445,51 @@ class Lead(Base):
     requirements = Column(Text, nullable=True)      # extra detail / notes
     status = Column(SAEnum(LeadStatus), default=LeadStatus.new)
     created_via = Column(String, default="voice")
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ── AtlasPrimeX dashboard/console domain (additive; agent never reads these) ──────
+# Holiday special-hours (tenant-scoped, surfaced to the agent via load_tenant_config),
+# plus operator-only Alerts and Tickets for the PrimeOps console.
+
+class Holiday(Base):
+    """Per-tenant holiday/special-hours entry, managed from the merchant Settings screen.
+    Surfaced in load_tenant_config so the agent can honor closed-all-day / special hours."""
+    __tablename__ = "holidays"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    name = Column(String, nullable=False)
+    date = Column(String, nullable=True)            # free-form label or YYYY-MM-DD
+    closed = Column(Boolean, default=True)          # closed all day
+    hours = Column(String, nullable=True)           # special hours when not closed
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class OpsAlert(Base):
+    """Operator-facing system/health alert shown in the PrimeOps console. References a
+    tenant (merchant) by id; not tenant-scoped for access (operators see the fleet)."""
+    __tablename__ = "ops_alerts"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    severity = Column(String, default="info")       # critical | warning | info
+    title = Column(String, nullable=False)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    merchant_name = Column(String, nullable=True)   # denormalized for display
+    body = Column(Text, nullable=True)
+    status = Column(String, default="active")       # active | dismissed
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class OpsTicket(Base):
+    """Operator-facing support ticket shown in the PrimeOps console."""
+    __tablename__ = "ops_tickets"
+    id = Column(String, primary_key=True, default=gen_uuid)
+    code = Column(String, nullable=True)            # e.g. "T-1042"
+    subject = Column(String, nullable=False)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=True)
+    merchant_name = Column(String, nullable=True)
+    status = Column(String, default="open")         # open | in_progress | resolved
+    priority = Column(String, default="medium")     # high | medium | low
+    assignee = Column(String, nullable=True)        # internal agent name or "—"
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

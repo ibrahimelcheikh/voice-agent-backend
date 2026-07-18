@@ -61,6 +61,14 @@ async def ensure_columns():
         "ALTER TABLE patients ADD COLUMN IF NOT EXISTS tenant_id VARCHAR",
         "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS tenant_id VARCHAR",
         "ALTER TABLE insurance_providers ADD COLUMN IF NOT EXISTS tenant_id VARCHAR",
+        # AtlasPrimeX dashboard/console (Phase 4). All additive & nullable — the voice
+        # agent keeps reading the same fields; new tables (holidays/ops_alerts/ops_tickets)
+        # are created by create_all. Never destroys data.
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS closed_greeting TEXT",
+        "ALTER TABLE services ADD COLUMN IF NOT EXISTS category VARCHAR",
+        "ALTER TABLE services ADD COLUMN IF NOT EXISTS details JSON",
+        "ALTER TABLE leads ADD COLUMN IF NOT EXISTS email VARCHAR",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS title VARCHAR",
     ]
     async with engine.begin() as conn:
         for stmt in statements:
