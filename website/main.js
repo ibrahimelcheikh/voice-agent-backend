@@ -67,3 +67,39 @@ document.querySelectorAll('.qa').forEach(qa=>{
     if(!open){qa.classList.add('open');ans.style.maxHeight=ans.scrollHeight+'px'}
   });
 });
+
+/* ---------- demo lead modal -> POST /api/v1/leads ---------- */
+(function(){
+  const modal=document.getElementById('demoModal');
+  if(!modal)return;
+  const form=document.getElementById('demoForm'),msg=document.getElementById('demoMsg');
+  const open=e=>{ if(e)e.preventDefault(); msg.textContent=''; msg.className='msg'; modal.classList.add('open'); };
+  const close=()=>modal.classList.remove('open');
+  document.querySelectorAll('[data-demo]').forEach(el=>el.addEventListener('click',open));
+  document.getElementById('demoClose').addEventListener('click',close);
+  modal.addEventListener('click',e=>{ if(e.target===modal)close(); });
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape')close(); });
+
+  form.addEventListener('submit',async e=>{
+    e.preventDefault();
+    const api=(window.ATLASPRIMEX_API||'').replace(/\/$/,'');
+    const data={
+      name:form.name.value.trim(),
+      email:form.email.value.trim(),
+      phone:form.phone.value.trim(),
+      message:form.message.value.trim(),
+      source:'website'
+    };
+    if(!data.name){ msg.className='msg err'; msg.textContent='Please enter your name.'; return; }
+    // No backend configured yet -> fall back to email so the button is never a dead end.
+    if(!api){ window.location.href='mailto:hello@atlasprimex.ai?subject=Demo%20request&body='+encodeURIComponent(JSON.stringify(data)); return; }
+    msg.className='msg'; msg.textContent='Sending…';
+    try{
+      const r=await fetch(api+'/api/v1/leads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+      if(!r.ok)throw new Error('HTTP '+r.status);
+      msg.className='msg ok'; msg.textContent='Thanks! We\'ll be in touch shortly.'; form.reset();
+    }catch(err){
+      msg.className='msg err'; msg.textContent='Could not send right now — email hello@atlasprimex.ai.';
+    }
+  });
+})();

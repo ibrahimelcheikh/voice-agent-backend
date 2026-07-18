@@ -27,7 +27,7 @@
     </div>
     <div class="nav-cta">
       <a class="btn btn-ghost" href="#">Login</a>
-      <a class="btn btn-primary" href="#cta">Get a demo</a>
+      <a class="btn btn-primary" href="#cta" data-demo>Get a demo</a>
     </div>
   </div>
 </nav>
@@ -39,7 +39,7 @@
     <p class="lede">AtlasPrimeX answers every call, books appointments, sends SMS confirmations, and answers treatment questions with total accuracy — so your front desk can focus on patients in the room.</p>
     <p class="ar-line">مساعد ذكي يرد على مكالمات عيادتك ويحجز المواعيد — بالعربية والإنجليزية، على مدار الساعة.</p>
     <div class="hero-ctas">
-      <a class="btn btn-primary" href="#cta">📞 Hear it live</a>
+      <a class="btn btn-primary" href="#cta" data-demo>📞 Hear it live</a>
       <a class="btn btn-ghost" href="#dashboard">See the dashboard</a>
     </div>
     <div class="hero-stats">
@@ -195,7 +195,7 @@
     <div class="cta reveal">
       <h2>Hear your clinic's AI receptionist</h2>
       <p>Book a live demo — we'll call you and let the agent take a booking in Arabic and English, exactly as your patients would experience it. <span class="ar">جرّبه بنفسك.</span></p>
-      <a class="btn btn-ghost" href="mailto:hello@atlasprimex.ai">📞 Book a live demo</a>
+      <a class="btn btn-ghost" href="mailto:hello@atlasprimex.ai" data-demo>📞 Book a live demo</a>
     </div>
   </div>
 </section>
@@ -215,6 +215,29 @@
   <div style="text-align:center;color:var(--sub);font-size:13px;padding:0 24px 26px">© 2026 AtlasPrimeX — Prime Tech AI</div>
 </footer>
 
+<!-- Demo-request modal -> POST /api/v1/leads -->
+<div class="modal-overlay" id="demoModal">
+  <div class="modal">
+    <button class="close" id="demoClose" aria-label="Close">×</button>
+    <h3>Book a live demo</h3>
+    <p class="sub">Leave your details and we'll call you — the agent takes a booking in Arabic and English, exactly as your patients would experience it.</p>
+    <form id="demoForm">
+      <label for="d-name">Name</label>
+      <input id="d-name" name="name" required placeholder="Your name">
+      <label for="d-email">Email</label>
+      <input id="d-email" name="email" type="email" placeholder="you@clinic.com">
+      <label for="d-phone">Phone</label>
+      <input id="d-phone" name="phone" placeholder="+966 …">
+      <label for="d-msg">Anything we should know?</label>
+      <textarea id="d-msg" name="message" rows="2" placeholder="Clinic name, city, services…"></textarea>
+      <button type="submit" class="btn btn-primary">Request my demo</button>
+      <div class="msg" id="demoMsg"></div>
+    </form>
+  </div>
+</div>
+
+<!-- Point this at your deployed backend. Leave blank to keep the mailto fallback. -->
+<script>window.ATLASPRIMEX_API = window.ATLASPRIMEX_API || "";</script>
 <script src="main.js"></script>
 </body>
 </html>

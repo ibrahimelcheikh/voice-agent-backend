@@ -204,4 +204,19 @@ footer{border-top:1px solid var(--line);background:var(--card)}
 .foot a{display:block;color:var(--ink);text-decoration:none;font-size:14.5px;font-weight:600;margin-bottom:9px}
 .foot a:hover{color:var(--blue)}
 .foot .tiny{color:var(--sub);font-size:13px;margin-top:10px}
+/* ---------- demo lead modal ---------- */
+.modal-overlay{position:fixed;inset:0;z-index:1000;background:rgba(16,24,38,.5);backdrop-filter:blur(4px);display:none;place-items:center;padding:20px}
+.modal-overlay.open{display:grid}
+.modal{background:var(--card);border-radius:24px;max-width:440px;width:100%;padding:32px;box-shadow:0 30px 80px rgba(16,24,38,.35);position:relative}
+.modal h3{font-family:var(--disp);font-size:24px;font-weight:800;letter-spacing:-.6px;margin-bottom:6px}
+.modal p.sub{color:var(--sub);font-size:15px;margin-bottom:20px;line-height:1.5}
+.modal .close{position:absolute;top:18px;right:18px;background:var(--card-alt);border:none;width:34px;height:34px;border-radius:50%;cursor:pointer;font-size:18px;color:var(--sub);line-height:1}
+.modal label{display:block;font-weight:700;font-size:13.5px;color:var(--sub);margin-bottom:6px}
+.modal input,.modal textarea{width:100%;box-sizing:border-box;padding:13px 14px;border-radius:12px;border:1.5px solid var(--line);background:var(--card);font-size:15px;color:var(--ink);font-family:var(--body);outline:none;margin-bottom:14px}
+.modal input:focus,.modal textarea:focus{border-color:var(--blue)}
+.modal .btn-primary{width:100%;justify-content:center;padding:14px}
+.modal .msg{text-align:center;padding:8px 0;font-weight:600}
+.modal .msg.ok{color:var(--green)}
+.modal .msg.err{color:var(--rose)}
+
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.reveal{opacity:1;transform:none}}
