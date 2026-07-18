@@ -1,0 +1,6 @@
+node_modules/
+clips-raw/
+clips/
+dash-shell/node_modules/
+dash-shell/dist/
+*.webm
