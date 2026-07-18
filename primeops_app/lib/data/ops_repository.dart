@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'api_client.dart';
 import 'models.dart';
 import 'mock_data.dart';
 
@@ -27,9 +28,14 @@ class MockOpsRepository implements OpsRepository {
   List<int> fleetVolume() => kFleetVol;
 }
 
+/// Phase 4 flag. Default true → bundled mock data. Build with
+/// `--dart-define=USE_MOCK=false --dart-define=API_BASE=https://…` to run against
+/// the live /api/v1 backend (operator login gate appears).
 const bool kUseMockData = bool.fromEnvironment('USE_MOCK', defaultValue: true);
 
-final opsRepositoryProvider = Provider<OpsRepository>((ref) {
-  // Phase 4: return kUseMockData ? const MockOpsRepository() : ApiOpsRepository(...);
-  return const MockOpsRepository();
-});
+final apiClientProvider = Provider<ApiClient>((ref) => ApiClient());
+
+/// Active repository. Mock by default; the login gate swaps in a hydrated
+/// [ApiOpsRepository] in API mode. Screens read it synchronously either way.
+final opsRepositoryProvider =
+    StateProvider<OpsRepository>((ref) => const MockOpsRepository());

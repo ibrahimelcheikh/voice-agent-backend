@@ -3,9 +3,11 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'data/mock_data.dart';
+import 'data/ops_repository.dart';
 import 'state/app_state.dart';
 import 'theme/tokens.dart';
 import 'screens/shell.dart';
+import 'screens/auth_gate.dart';
 
 void main() {
   // Optional deep-linking for testing/sharing, e.g.
@@ -58,7 +60,7 @@ class PrimeOpsApp extends StatelessWidget {
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
       ],
-      home: const OpsShell(),
+      home: kUseMockData ? const OpsShell() : const AuthGate(),
     );
   }
 }

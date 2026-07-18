@@ -3,9 +3,11 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'data/mock_data.dart';
+import 'data/merchant_repository.dart';
 import 'state/app_state.dart';
 import 'theme/tokens.dart';
 import 'screens/shell.dart';
+import 'screens/auth_gate.dart';
 
 void main() {
   // Optional deep-linking via query params, e.g.
@@ -70,7 +72,7 @@ class MerchantApp extends ConsumerWidget {
         textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
         child: child!,
       ),
-      home: const MerchantShell(),
+      home: kUseMockData ? const MerchantShell() : const AuthGate(),
     );
   }
 }

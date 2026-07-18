@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'api_client.dart';
 import 'models.dart';
 import 'mock_data.dart';
 
@@ -47,13 +48,15 @@ class MockMerchantRepository implements MerchantRepository {
   Map<String, List<Report>> reports() => kReports;
 }
 
-/// Toggle for Phase 4. When an API repository exists, flip this (or wire it to a
-/// `--dart-define=USE_MOCK=false`) to serve the merchant app from the live
-/// backend instead of the bundled mock data.
-const bool kUseMockData =
-    bool.fromEnvironment('USE_MOCK', defaultValue: true);
+/// Phase 4 flag. Default true → bundled mock data (works with no backend).
+/// Build with `--dart-define=USE_MOCK=false --dart-define=API_BASE=https://…` to run
+/// the app against the live /api/v1 backend (a login screen then appears).
+const bool kUseMockData = bool.fromEnvironment('USE_MOCK', defaultValue: true);
 
-final merchantRepositoryProvider = Provider<MerchantRepository>((ref) {
-  // Phase 4: `return kUseMockData ? const MockMerchantRepository() : ApiMerchantRepository(...);`
-  return const MockMerchantRepository();
-});
+/// Shared authenticated API client.
+final apiClientProvider = Provider<ApiClient>((ref) => ApiClient());
+
+/// The active repository. Starts as the mock; in API mode the login gate replaces it
+/// with a hydrated [ApiMerchantRepository]. Screens read it synchronously either way.
+final merchantRepositoryProvider =
+    StateProvider<MerchantRepository>((ref) => const MockMerchantRepository());
