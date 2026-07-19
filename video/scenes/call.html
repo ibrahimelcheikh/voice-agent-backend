@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="/assets/fonts.css">
+<style>
+:root{--bg:#EFE9DF;--card:#FDFBF7;--card-alt:#F5F0E7;--ink:#101826;--sub:#66707F;--line:#E6DECF;
+  --blue:#2E6BFF;--deep:#1E4FD8;--soft:#E7EEFF;--green:#3FB27F;--green-soft:#E4F5EC;--rose:#E76A8B;--rose-soft:#FBE6EC;--amber:#E8934A;--amber-soft:#FBEAD9;
+  --disp:'Poppins','Segoe UI',system-ui,sans-serif;--ar:'Noto Sans Arabic','Segoe UI',sans-serif;}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg);font-family:var(--disp)}
+.orb{position:fixed;border-radius:50%;filter:blur(90px);opacity:.5;pointer-events:none}
+.o1{width:600px;height:600px;background:radial-gradient(circle,#CFE0FF,transparent 70%);top:-160px;right:-120px;animation:drift 22s ease-in-out infinite}
+.o2{width:520px;height:520px;background:radial-gradient(circle,#DCE9FF,transparent 70%);bottom:-160px;left:-120px;animation:drift 28s ease-in-out infinite reverse}
+@keyframes drift{0%,100%{transform:translate(0,0)}50%{transform:translate(50px,40px)}}
+.wrap{position:relative;z-index:2;width:1920px;height:1080px;display:grid;place-items:center}
+.phone{width:440px;height:880px;background:var(--card);border-radius:46px;border:2px solid var(--line);
+  box-shadow:0 40px 90px rgba(16,24,38,.20);overflow:hidden;position:relative;transition:transform .8s cubic-bezier(.2,.8,.2,1)}
+.phone.shift{transform:translateX(-330px)}
+.p-top{background:linear-gradient(135deg,var(--blue),var(--deep));padding:26px 26px 22px;color:#fff;display:flex;align-items:center;gap:14px}
+.ava{width:52px;height:52px;border-radius:50%;background:rgba(255,255,255,.2);display:grid;place-items:center;font-family:var(--ar);font-weight:700;font-size:22px;position:relative}
+.pulse{position:absolute;inset:-6px;border-radius:50%;border:2px solid rgba(255,255,255,.55);animation:pulse 1.8s ease-out infinite}
+@keyframes pulse{0%{transform:scale(.8);opacity:1}100%{transform:scale(1.55);opacity:0}}
+.who{font-weight:700;font-size:18px}.st{font-size:14px;opacity:.9;display:flex;align-items:center;gap:7px;margin-top:2px}
+.dot{width:8px;height:8px;border-radius:50%;background:#7CFFC0;animation:blink 1.4s infinite}@keyframes blink{50%{opacity:.35}}
+.timer{margin-left:auto;font-variant-numeric:tabular-nums;font-weight:700;font-size:15px;background:rgba(255,255,255,.16);padding:6px 13px;border-radius:999px}
+.body{position:absolute;top:100px;left:0;right:0;bottom:0;padding:18px 18px 24px;overflow:hidden}
+
+/* dial screen */
+.dial{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:30px;opacity:0;transition:opacity .4s}
+.dial .num{font-family:var(--disp);font-weight:700;font-size:30px;letter-spacing:1px;color:var(--ink);min-height:40px}
+.dial .call-lbl{color:var(--sub);font-weight:600;font-size:17px}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:8px}
+.key{width:78px;height:78px;border-radius:50%;background:var(--card-alt);display:grid;place-items:center;font-weight:600;font-size:26px;color:var(--ink);transition:.15s}
+.key.hot{background:var(--blue);color:#fff;transform:scale(1.08)}
+.ring{width:96px;height:96px;border-radius:50%;background:var(--green);display:grid;place-items:center;color:#fff;font-size:38px;position:relative}
+.ring::before,.ring::after{content:'';position:absolute;inset:0;border-radius:50%;border:3px solid var(--green);animation:rings 1.6s ease-out infinite}
+.ring::after{animation-delay:.8s}
+@keyframes rings{0%{transform:scale(1);opacity:.7}100%{transform:scale(1.8);opacity:0}}
+
+/* IVR */
+.ivr{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:34px;opacity:0;transition:opacity .4s;text-align:center}
+.ivr .ar{font-family:var(--ar);font-size:23px;font-weight:600;color:var(--ink);direction:rtl;line-height:1.6}
+.ivr .opt{background:var(--card-alt);border-radius:16px;padding:16px 20px;font-weight:600;font-size:17px;color:var(--ink);width:100%;display:flex;align-items:center;justify-content:space-between;gap:12px}
+.ivr .opt .kx{width:40px;height:40px;border-radius:12px;background:#fff;border:1.5px solid var(--line);display:grid;place-items:center;font-weight:800;transition:.15s}
+.ivr .opt.sel .kx{background:var(--blue);color:#fff;border-color:var(--blue);transform:scale(1.1)}
+.ivr .ar-opt{font-family:var(--ar);direction:rtl}
+
+/* chat */
+.chat{position:absolute;inset:0;padding:6px 4px;display:flex;flex-direction:column;gap:12px;overflow:hidden}
+.msg{max-width:86%;padding:13px 17px;border-radius:18px;font-size:16px;line-height:1.5;opacity:0;transform:translateY(14px);transition:opacity .45s,transform .45s}
+.msg.show{opacity:1;transform:none}
+.msg.caller{align-self:flex-end;background:var(--soft);color:var(--ink);border-bottom-right-radius:6px;font-family:var(--ar);direction:rtl}
+.msg.agent{align-self:flex-start;background:var(--card-alt);border:1px solid var(--line);border-bottom-left-radius:6px;font-family:var(--ar);direction:rtl}
+.msg .sub{display:block;font-family:var(--disp);direction:ltr;font-size:12.5px;color:var(--sub);font-weight:500;margin-top:5px;text-align:left}
+.msg.caller .sub{text-align:right}
+.chip{align-self:center;background:var(--green-soft);color:#1F7A55;font-size:14.5px;font-weight:700;padding:11px 18px;border-radius:999px;opacity:0;transform:translateY(12px);transition:.45s;text-align:center}
+.chip.show{opacity:1;transform:none}
+.banner{align-self:stretch;background:var(--rose-soft);color:#B23A5B;border:1.5px solid var(--rose);border-radius:16px;padding:15px 16px;font-weight:800;font-size:15.5px;display:flex;align-items:center;gap:12px;opacity:0;transform:translateY(12px);transition:.45s}
+.banner.show{opacity:1;transform:none}
+.banner .rp{width:14px;height:14px;border-radius:50%;background:var(--rose);position:relative;flex-shrink:0}
+.banner .rp::after{content:'';position:absolute;inset:0;border-radius:50%;border:2px solid var(--rose);animation:rings 1.4s ease-out infinite}
+
+/* end card */
+.endcard{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;padding:40px;opacity:0;transition:opacity .5s;text-align:center;background:var(--card)}
+.endcard .lg{width:64px;height:64px;border-radius:18px;overflow:hidden}
+.endcard img{width:100%}
+.endcard h2{font-size:27px;font-weight:800;letter-spacing:-.6px;color:var(--ink);line-height:1.25}
+.endcard .b{color:var(--blue)}
+
+/* ticket side panel */
+.panel{position:fixed;top:50%;transform:translateY(-50%);right:-560px;width:500px;background:var(--card);border-radius:26px;border:1.5px solid var(--line);
+  box-shadow:0 40px 90px rgba(16,24,38,.18);padding:30px;z-index:5;transition:right .8s cubic-bezier(.2,.8,.2,1)}
+.panel.active{right:120px}
+.panel .ph{display:flex;align-items:center;gap:14px;margin-bottom:18px}
+.panel .tk{width:52px;height:52px;border-radius:15px;background:var(--rose-soft);color:var(--rose);display:grid;place-items:center;font-size:24px}
+.panel h3{font-size:22px;font-weight:900;color:var(--ink)}.panel .code{color:var(--sub);font-weight:700;font-size:15px}
+.panel .row{display:flex;justify-content:space-between;padding:15px 0;border-top:1px solid var(--line);font-size:16px}
+.panel .row .k{color:var(--sub);font-weight:600}.panel .row .v{font-weight:800;color:var(--ink)}
+.steps{display:flex;align-items:center;gap:8px;margin-top:22px;flex-wrap:wrap}
+.pill{padding:9px 15px;border-radius:999px;font-weight:800;font-size:14.5px;background:var(--card-alt);color:var(--sub);opacity:.5;transition:.4s}
+.pill.on{opacity:1}
+.pill.esc.on{background:var(--rose-soft);color:var(--rose)}
+.pill.prog.on{background:var(--amber-soft);color:var(--amber)}
+.pill.assign.on{background:var(--green-soft);color:#1F7A55}
+.arrow{color:var(--sub);font-weight:900}
+</style>
+</head>
+<body>
+<div class="orb o1"></div><div class="orb o2"></div>
+<div class="wrap">
+  <div class="phone" id="phone">
+    <div class="p-top" id="ptop" style="opacity:0;transition:opacity .4s">
+      <div class="ava"><span class="pulse"></span>ر</div>
+      <div><div class="who">Reem — Divinia Clinic</div><div class="st"><span class="dot"></span> Live call</div></div>
+      <div class="timer" id="timer">00:00</div>
+    </div>
+    <div class="body">
+      <div class="dial" id="dial">
+        <div class="num" id="num"></div>
+        <div class="call-lbl" id="calllbl">&nbsp;</div>
+        <div class="pad" id="pad"></div>
+        <div class="ring" id="ring" style="display:none">📞</div>
+      </div>
+      <div class="ivr" id="ivr">
+        <div class="ar">أهلاً بك في عيادة ديفينيا</div>
+        <div class="opt" id="opt1"><span>For English, press 1</span><span class="kx">1</span></div>
+        <div class="opt ar-opt" id="opt2"><span>للعربية اضغط ٢</span><span class="kx">٢</span></div>
+      </div>
+      <div class="chat" id="chat"></div>
+      <div class="endcard" id="endcard">
+        <div class="lg"><img src="/assets/logo-mark.png"></div>
+        <h2>Every call answered.<br><span class="b">Every booking captured.</span></h2>
+      </div>
+    </div>
+  </div>
+  <div class="panel" id="panel">
+    <div class="ph"><div class="tk">🎫</div><div><h3>Support ticket</h3><div class="code">T-1043 · Auto-created</div></div></div>
+    <div class="row"><span class="k">Subject</span><span class="v">Post-filler concern</span></div>
+    <div class="row"><span class="k">Merchant</span><span class="v">Divinia Clinic</span></div>
+    <div class="row"><span class="k">Priority</span><span class="v" style="color:var(--rose)">High</span></div>
+    <div class="steps">
+      <span class="pill esc" id="pEsc">Escalated</span><span class="arrow">→</span>
+      <span class="pill prog" id="pProg">In progress</span><span class="arrow">→</span>
+      <span class="pill assign" id="pAssign">Assigned to Layla</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let secs=0,timerOn=false;
+setInterval(()=>{ if(!timerOn)return; secs++; const m=String(Math.floor(secs/60)).padStart(2,'0'),s=String(secs%60).padStart(2,'0'); $('timer').textContent=m+':'+s; },1000);
+// build dial pad
+const keys=['1','2','3','4','5','6','7','8','9','*','0','#'];
+$('pad').innerHTML=keys.map(k=>`<div class="key" data-k="${k}">${k}</div>`).join('');
+const show=(el,v=true)=>{ el.style.opacity=v?'1':'0'; };
+const chat=$('chat');
+function bubble(cls,ar,sub){
+  const d=document.createElement('div'); d.className='msg '+cls;
+  d.innerHTML=ar+(sub?`<span class="sub">${sub}</span>`:'');
+  chat.appendChild(d); chat.scrollTop=chat.scrollHeight;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{ d.classList.add('show'); chat.scrollTop=chat.scrollHeight; }));
+  return d;
+}
+function chip(cls,txt){ const d=document.createElement('div'); d.className='chip'; if(cls)d.style.cssText+=''; d.textContent=txt; if(cls==='blue'){d.style.background='#E7EEFF';d.style.color='#1E4FD8';} chat.appendChild(d); requestAnimationFrame(()=>requestAnimationFrame(()=>d.classList.add('show'))); chat.scrollTop=chat.scrollHeight; return d; }
+function banner(txt){ const d=document.createElement('div'); d.className='banner'; d.innerHTML='<span class="rp"></span>'+txt; chat.appendChild(d); requestAnimationFrame(()=>requestAnimationFrame(()=>d.classList.add('show'))); chat.scrollTop=chat.scrollHeight; return d; }
+function clearChat(){ chat.innerHTML=''; }
+
+const T=[];
+const at=(ms,fn)=>T.push(setTimeout(fn,ms));
+
+// STAGE 1 — dial
+show($('dial'),true);
+(function typeNum(){ const full='+966 11 234 5678'; let i=0; const iv=setInterval(()=>{ $('num').textContent=full.slice(0,++i); if(i>=full.length)clearInterval(iv); },90); })();
+at(1900,()=>{ $('pad').style.display='none'; $('ring').style.display='grid'; $('calllbl').textContent='Calling Divinia Clinic…'; });
+
+// STAGE 2 — IVR
+at(3200,()=>{ show($('dial'),false); });
+at(3600,()=>{ show($('ivr'),true); });
+at(5200,()=>{ $('opt2').classList.add('sel'); });
+at(5600,()=>{ show($('ptop'),true); timerOn=true; });
+
+// STAGE 3 — conversation
+at(6400,()=>{ show($('ivr'),false); });
+at(6900,()=>bubble('agent','أهلاً بعيادة ديفينيا، كيف أقدر أساعدك؟','Welcome to Divinia Clinic — how can I help?'));
+at(8300,()=>bubble('caller','أبغى موعد بوتوكس يوم الثلاثاء','I\'d like a Botox appointment on Tuesday'));
+at(9800,()=>bubble('agent','أكيد! يناسبك المساء؟ عندنا ٦:٠٠ متاح','Sure! Does evening work? 6:00 PM is open'));
+at(11300,()=>bubble('caller','تمام، ٦ المساء','Perfect, 6 PM'));
+at(12700,()=>bubble('agent','تم تأكيد موعدك الثلاثاء ٦:٠٠ مساءً 💙','Confirmed — Tuesday at 6:00 PM 💙'));
+at(14000,()=>chip('green','✓ SMS confirmation sent · 24h reminder set'));
+
+// STAGE 4 — reschedule
+at(16400,()=>bubble('caller','ممكن أغيّره للسبت؟','Can I move it to Saturday?'));
+at(17800,()=>bubble('agent','غيّرته للسبت ٥:٠٠ مساءً ✅','Moved to Saturday 5:00 PM ✅'));
+at(19100,()=>chip('blue','✓ Booking updated'));
+
+// STAGE 5 — urgent + ticket
+at(21400,()=>{ clearChat(); });
+at(21700,()=>bubble('caller','عندي انتفاخ بعد الفيلر','I have swelling after fillers'));
+at(23000,()=>banner('URGENT — transferring to on-call clinician'));
+at(24000,()=>{ $('phone').classList.add('shift'); $('panel').classList.add('active'); });
+at(25200,()=>$('pEsc').classList.add('on'));
+at(26400,()=>$('pProg').classList.add('on'));
+at(27600,()=>$('pAssign').classList.add('on'));
+
+// STAGE 6 — end card
+at(29800,()=>{ $('panel').classList.remove('active'); $('phone').classList.remove('shift'); });
+at(30400,()=>{ clearChat(); show($('ptop'),false); $('endcard').style.opacity='1'; timerOn=false; });
+</script>
+</body>
+</html>

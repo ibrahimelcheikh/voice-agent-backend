@@ -21,7 +21,7 @@ import re
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.models.models import Tenant, Agent, AgentType, BehaviorConfig
+from app.models.models import Tenant, Agent, AgentType, BehaviorConfig, Holiday
 
 # Default greeting/system prompt when a tenant hasn't set its own. Kept generic; the
 # seeded clinic supplies its own greeting so existing behavior is unchanged.
@@ -141,12 +141,20 @@ async def load_tenant_config(db, tenant: Tenant) -> dict:
                 system_prompt = cfg.system_prompt or system_prompt
                 max_call_duration = cfg.max_call_duration or max_call_duration
 
+    # Closed-hours greeting + holidays + temporary closure (Phase 4, all additive/optional).
+    # These are surfaced so the agent CAN honor them; when unset, behavior is unchanged.
+    holidays = (await db.execute(
+        select(Holiday).where(Holiday.tenant_id == tenant.id)
+    )).scalars().all()
+    tenant_config = tenant.config or {}
+
     return {
         "tenant_id": tenant.id,
         "agent_id": agent.id if agent else None,
         "business_name": tenant.business_name,
         "niche": tenant.niche.value if tenant.niche else "clinic",
         "greeting_message": tenant.greeting_message or _DEFAULT_GREETING,
+        "closed_greeting": tenant.closed_greeting,
         "system_prompt": system_prompt or _DEFAULT_SYSTEM_PROMPT,
         "voice_id": voice_id,
         "max_call_duration": max_call_duration,
@@ -154,7 +162,12 @@ async def load_tenant_config(db, tenant: Tenant) -> dict:
         "supported_languages": tenant.supported_languages or ["en"],
         "timezone": tenant.timezone or "Asia/Beirut",
         "knowledge_base": tenant.knowledge_base or {},
-        "config": tenant.config or {},
+        "config": tenant_config,
+        "temporary_closure": tenant_config.get("temporary_closure"),
+        "holidays": [
+            {"name": h.name, "date": h.date, "closed": h.closed, "hours": h.hours}
+            for h in holidays
+        ],
         "twilio_phone_number": tenant.twilio_phone_number,
     }
 

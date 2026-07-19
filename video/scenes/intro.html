@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="/assets/fonts.css">
+<style>
+:root{--bg:#EFE9DF;--ink:#101826;--sub:#66707F;--blue:#2E6BFF;--deep:#1E4FD8;
+  --disp:'Poppins','Segoe UI',system-ui,sans-serif;--ar:'Noto Sans Arabic','Segoe UI',sans-serif;}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg);font-family:var(--disp)}
+.stage{position:relative;width:1920px;height:1080px;display:grid;place-items:center}
+.orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;pointer-events:none}
+.orb1{width:720px;height:720px;background:radial-gradient(circle,#CFE0FF,transparent 70%);top:-180px;right:-120px;animation:drift 20s ease-in-out infinite}
+.orb2{width:600px;height:600px;background:radial-gradient(circle,#DCE9FF,transparent 70%);bottom:-140px;left:-120px;animation:drift 26s ease-in-out infinite reverse}
+.orb3{width:420px;height:420px;background:radial-gradient(circle,#E7EEFF,transparent 70%);top:40%;left:44%;animation:drift 22s ease-in-out infinite}
+@keyframes drift{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(60px,50px) scale(1.12)}}
+.wrap{position:relative;z-index:2;text-align:center}
+.logo{width:640px;opacity:0;transform:scale(.82);animation:logoIn 1.4s cubic-bezier(.2,.8,.2,1) .2s forwards}
+@keyframes logoIn{to{opacity:1;transform:scale(1)}}
+.tag{margin-top:44px;font-size:40px;font-weight:700;letter-spacing:-1px;color:var(--ink);opacity:0;transform:translateY(24px);animation:up 1s ease .9s forwards}
+.tag .grad{background:linear-gradient(100deg,var(--blue),var(--deep));-webkit-background-clip:text;background-clip:text;color:transparent}
+.ar{margin-top:20px;font-family:var(--ar);font-size:27px;color:var(--sub);font-weight:600;opacity:0;transform:translateY(20px);animation:up 1s ease 1.5s forwards;direction:rtl}
+@keyframes up{to{opacity:1;transform:none}}
+.badge{display:inline-flex;align-items:center;gap:10px;margin-bottom:40px;background:#FDFBF7;border:1.5px solid #E6DECF;border-radius:999px;padding:12px 24px;font-weight:700;font-size:19px;color:var(--ink);opacity:0;animation:up 1s ease .5s forwards}
+.badge .st{color:#F5A623;letter-spacing:2px}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="orb orb1"></div><div class="orb orb2"></div><div class="orb orb3"></div>
+  <div class="wrap">
+    <span class="badge"><span class="st">★★★★★</span> Built for Gulf clinics &amp; med spas</span><br>
+    <img class="logo" src="/assets/logo.png" alt="AtlasPrimeX">
+    <div class="tag">Your clinic's phone, <span class="grad">answered 24/7</span></div>
+    <div class="tag" style="animation-delay:1.1s;font-size:34px;margin-top:10px">in Arabic &amp; English</div>
+    <div class="ar">مساعد ذكي يرد على مكالمات عيادتك — بالعربية والإنجليزية</div>
+  </div>
+</div>
+</body>
+</html>

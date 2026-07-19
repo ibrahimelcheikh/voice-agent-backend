@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<link rel="stylesheet" href="/assets/fonts.css">
+<style>
+:root{--bg:#EFE9DF;--ink:#101826;--sub:#66707F;--blue:#2E6BFF;--deep:#1E4FD8;--card:#FDFBF7;--line:#E6DECF;
+  --disp:'Poppins','Segoe UI',system-ui,sans-serif;--ar:'Noto Sans Arabic',sans-serif;}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:1920px;height:1080px;overflow:hidden;background:var(--bg);font-family:var(--disp)}
+.orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:.5;pointer-events:none}
+.o1{width:640px;height:640px;background:radial-gradient(circle,#CFE0FF,transparent 70%);top:-160px;left:-120px;animation:drift 24s ease-in-out infinite}
+.o2{width:560px;height:560px;background:radial-gradient(circle,#DCE9FF,transparent 70%);bottom:-160px;right:-120px;animation:drift 28s ease-in-out infinite reverse}
+@keyframes drift{0%,100%{transform:translate(0,0) scale(1)}50%{transform:translate(50px,44px) scale(1.1)}}
+.wrap{position:relative;z-index:2;width:1920px;height:1080px;display:grid;place-items:center;text-align:center}
+.logo{width:560px;opacity:0;transform:scale(.86);animation:in 1.2s cubic-bezier(.2,.8,.2,1) .2s forwards}
+@keyframes in{to{opacity:1;transform:none}}
+.by{margin-top:22px;font-size:24px;font-weight:600;color:var(--sub);opacity:0;animation:up 1s ease .8s forwards}
+.cta{margin-top:52px;display:inline-flex;align-items:center;gap:12px;background:linear-gradient(135deg,var(--blue),var(--deep));color:#fff;
+  font-weight:800;font-size:26px;padding:20px 40px;border-radius:999px;box-shadow:0 16px 40px rgba(46,107,255,.4);opacity:0;transform:translateY(20px);animation:up 1s ease 1.2s forwards}
+.url{margin-top:30px;font-size:22px;font-weight:600;color:var(--ink);opacity:0;animation:up 1s ease 1.6s forwards}
+.url .b{color:var(--blue);font-weight:700}
+.ar{margin-top:14px;font-family:var(--ar);font-size:22px;color:var(--sub);opacity:0;animation:up 1s ease 2s forwards}
+@keyframes up{to{opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<div class="orb o1"></div><div class="orb o2"></div>
+<div class="wrap">
+  <div>
+    <img class="logo" src="/assets/logo.png" alt="AtlasPrimeX">
+    <div class="by">by Prime Tech AI</div>
+    <div><span class="cta">📞 Book a live demo</span></div>
+    <div class="url">www.<span class="b">atlasprimex.ai</span> · hello@atlasprimex.ai</div>
+    <div class="ar">جرّبه بنفسك — على مدار الساعة</div>
+  </div>
+</div>
+</body>
+</html>
