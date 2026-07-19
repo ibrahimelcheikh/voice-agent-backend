@@ -4,7 +4,7 @@ import 'package:primeops_app/main.dart';
 
 void main() {
   testWidgets('PrimeOps app boots', (tester) async {
-    await tester.pumpWidget(const ProviderScope(child: PrimeOpsApp()));
+    await tester.pumpWidget(const ProviderScope(child: PrimeOpsApp(useMock: true)));
     await tester.pump();
     expect(find.byType(PrimeOpsApp), findsOneWidget);
   });

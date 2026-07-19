@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'app_config.dart';
+import 'data/api_client.dart';
 import 'data/mock_data.dart';
 import 'data/ops_repository.dart';
 import 'state/app_state.dart';
@@ -9,11 +11,21 @@ import 'theme/tokens.dart';
 import 'screens/shell.dart';
 import 'screens/auth_gate.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Resolve the backend URL at runtime from web/config.json (no rebuild needed).
+  // Null => no usable backend => stay on bundled mock data (still renders fully).
+  final apiBaseUrl = await AppConfig.resolveApiBaseUrl();
+  final useMock = apiBaseUrl == null;
+
   // Optional deep-linking for testing/sharing, e.g.
   //   ?nav=merchants&merchant=1   ?view=merchant&mvlang=ar   ?nav=onboarding&step=3
   final q = Uri.base.queryParameters;
   final overrides = <Override>[];
+  if (apiBaseUrl != null) {
+    overrides.add(apiClientProvider.overrideWith((ref) => ApiClient(base: apiBaseUrl)));
+  }
   if (q['nav'] != null) overrides.add(navProvider.overrideWith((ref) => q['nav']!));
   if (q['view'] == 'merchant') overrides.add(merchantViewProvider.overrideWith((ref) => true));
   if (q['mvlang'] == 'ar' || q['mvlang'] == 'en') {
@@ -31,11 +43,14 @@ void main() {
     if (s != null) overrides.add(onboardingStepProvider.overrideWith((ref) => s));
   }
   if (q['adduser'] == '1') overrides.add(addUserProvider.overrideWith((ref) => true));
-  runApp(ProviderScope(overrides: overrides, child: const PrimeOpsApp()));
+  runApp(ProviderScope(overrides: overrides, child: PrimeOpsApp(useMock: useMock)));
 }
 
 class PrimeOpsApp extends StatelessWidget {
-  const PrimeOpsApp({super.key});
+  const PrimeOpsApp({super.key, required this.useMock});
+
+  /// True => bundled mock data (fallback); false => live backend (login gate).
+  final bool useMock;
 
   @override
   Widget build(BuildContext context) {
@@ -60,7 +75,7 @@ class PrimeOpsApp extends StatelessWidget {
         GlobalWidgetsLocalizations.delegate,
         GlobalCupertinoLocalizations.delegate,
       ],
-      home: kUseMockData ? const OpsShell() : const AuthGate(),
+      home: useMock ? const OpsShell() : const AuthGate(),
     );
   }
 }

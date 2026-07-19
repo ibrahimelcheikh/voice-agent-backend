@@ -1,15 +1,5 @@
-# Serves the compiled Flutter web build on $PORT (Railway injects it).
-:{$PORT:8080} {
-	root * /srv
-	encode gzip zstd
-	@assets path /assets/* *.js *.wasm *.json *.png *.ico *.ttf /canvaskit/*
-	header @assets Cache-Control "public, max-age=31536000, immutable"
-	header {
-		X-Content-Type-Options "nosniff"
-		Referrer-Policy "strict-origin-when-cross-origin"
-		-Server
-	}
-	# SPA fallback so query-param deep links resolve.
+:{$PORT} {
+	root * /usr/share/caddy
 	try_files {path} /index.html
 	file_server
 }
