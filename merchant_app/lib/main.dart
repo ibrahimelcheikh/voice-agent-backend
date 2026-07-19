@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'app_config.dart';
+import 'data/api_client.dart';
 import 'data/mock_data.dart';
 import 'data/merchant_repository.dart';
 import 'state/app_state.dart';
@@ -9,11 +11,21 @@ import 'theme/tokens.dart';
 import 'screens/shell.dart';
 import 'screens/auth_gate.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Resolve the backend URL at runtime from web/config.json (no rebuild needed).
+  // Null => no usable backend => stay on bundled mock data (still renders fully).
+  final apiBaseUrl = await AppConfig.resolveApiBaseUrl();
+  final useMock = apiBaseUrl == null;
+
   // Optional deep-linking via query params, e.g.
   // ?lang=ar&nav=settings&tab=voice  or  ?nav=services&service=botox
   final q = Uri.base.queryParameters;
   final overrides = <Override>[];
+  if (apiBaseUrl != null) {
+    overrides.add(apiClientProvider.overrideWith((ref) => ApiClient(base: apiBaseUrl)));
+  }
   if (q['lang'] == 'ar' || q['lang'] == 'en') {
     overrides.add(languageProvider.overrideWith((ref) => q['lang']!));
   }
@@ -25,11 +37,14 @@ void main() {
     final b = kBranches.where((x) => '${x.id}' == q['branch']);
     if (b.isNotEmpty) overrides.add(branchProvider.overrideWith((ref) => b.first));
   }
-  runApp(ProviderScope(overrides: overrides, child: const MerchantApp()));
+  runApp(ProviderScope(overrides: overrides, child: MerchantApp(useMock: useMock)));
 }
 
 class MerchantApp extends ConsumerWidget {
-  const MerchantApp({super.key});
+  const MerchantApp({super.key, required this.useMock});
+
+  /// True => bundled mock data (fallback); false => live backend (login gate).
+  final bool useMock;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -72,7 +87,7 @@ class MerchantApp extends ConsumerWidget {
         textDirection: rtl ? TextDirection.rtl : TextDirection.ltr,
         child: child!,
       ),
-      home: kUseMockData ? const MerchantShell() : const AuthGate(),
+      home: useMock ? const MerchantShell() : const AuthGate(),
     );
   }
 }
