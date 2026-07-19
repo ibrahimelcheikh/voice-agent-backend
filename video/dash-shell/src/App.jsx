@@ -956,7 +956,7 @@ function Support({ t }) {
         <IconBox bg={C.blueSoft} fg={C.blue}><MessageSquare size={22} /></IconBox>
         <div style={{ height: 12 }} />
         <div style={{ fontWeight: 900, fontSize: 20, marginBottom: 6 }}>AtlasPrimeX Support</div>
-        <p style={{ color: C.sub, margin: "0 0 16px" }}>support@atlasprimex.ai</p>
+        <p style={{ color: C.sub, margin: "0 0 16px" }}>support@atlasprimex.com</p>
         <button style={{ ...btnDark, margin: "0 auto" }}><MessageSquare size={16} /> Start chat</button>
       </Card>
     </div>
