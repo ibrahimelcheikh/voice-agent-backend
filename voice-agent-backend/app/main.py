@@ -81,6 +81,13 @@ async def startup():
         await seed_atlasprimex_demo()
     except Exception as e:
         print(f"[seed] AtlasPrimeX demo seed skipped: {type(e).__name__}: {e}")
+    # Dashboard-friendly, reversible demo routing: point DEMO_CALLABLE_NUMBER at the tenant
+    # named by ACTIVE_DEMO_TENANT (blank = no-op). Never blocks boot.
+    try:
+        from app.db.seed_atlasprimex import run_boot_demo_switch
+        await run_boot_demo_switch()
+    except Exception as e:
+        print(f"[boot-switch] skipped: {type(e).__name__}: {e}")
     # NOTE: We deliberately DO NOT reconfigure the Twilio number's voice webhook on boot.
     # Inbound calls are routed via a Twilio Elastic SIP Trunk (Origination URI ->
     # <proj>.sip.livekit.cloud) into the LiveKit inbound SIP trunk + dispatch rule, which
