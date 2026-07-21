@@ -4,7 +4,7 @@ see all tenants, merchants are scoped to their own tenant."""
 from fastapi import APIRouter
 
 from . import auth, tenants, services, calls, appointments, settings as settings_routes
-from . import alerts, tickets, users, analytics, leads
+from . import alerts, tickets, users, analytics, leads, dashboard
 
 router = APIRouter()
 router.include_router(auth.router, prefix="/auth", tags=["v1 · Auth"])
@@ -18,3 +18,4 @@ router.include_router(tickets.router, prefix="/tickets", tags=["v1 · Tickets"])
 router.include_router(users.router, prefix="/users", tags=["v1 · Users"])
 router.include_router(analytics.router, prefix="/analytics", tags=["v1 · Analytics"])
 router.include_router(leads.router, prefix="/leads", tags=["v1 · Leads"])
+router.include_router(dashboard.router, tags=["v1 · Dashboard (merchant, no-auth)"])
