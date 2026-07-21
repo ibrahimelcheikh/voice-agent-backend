@@ -88,6 +88,8 @@ class Appt {
   final String date;
   final String time;
   final String via;
+  final String? id;      // backend appointment id (real data) — null for mock rows
+  final String? status;  // booked | confirmed | rescheduled | cancelled | completed
   const Appt({
     required this.name,
     required this.svc,
@@ -95,6 +97,8 @@ class Appt {
     required this.date,
     required this.time,
     required this.via,
+    this.id,
+    this.status,
   });
 }
 

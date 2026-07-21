@@ -1,3 +1,5 @@
 {
-  "apiBaseUrl": "https://PLACEHOLDER"
+  "apiBaseUrl": "https://voice-agent-backend-production-fa4e.up.railway.app",
+  "useRealApi": true,
+  "tenantSlug": "apx-divinia"
 }

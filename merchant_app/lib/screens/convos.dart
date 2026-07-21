@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/dashboard_repository.dart';
 import '../data/merchant_repository.dart';
 import '../data/models.dart';
 import '../l10n/strings.dart';
@@ -22,6 +23,7 @@ class _ConvosScreenState extends ConsumerState<ConvosScreen> {
     final lang = ref.watch(languageProvider);
     final s = S.of(lang);
     final rtl = lang == 'ar';
+    ref.watch(refreshTickProvider); // rebuild after pull-to-refresh
     final all = ref.read(merchantRepositoryProvider).conversations();
     final list = all.where((c) => q.isEmpty || c.name.toLowerCase().contains(q.toLowerCase())).toList();
 

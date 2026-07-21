@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/dashboard_repository.dart';
 import '../data/merchant_repository.dart';
 import '../data/models.dart';
 import '../l10n/strings.dart';
@@ -44,14 +45,18 @@ class MerchantShell extends ConsumerWidget {
           children: [
             const _TopBar(),
             Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(16),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 640),
-                    child: KeyedSubtree(
-                      key: ValueKey('$nav-$lang'),
-                      child: _screenFor(nav),
+              child: RefreshIndicator(
+                onRefresh: () => _refresh(ref),
+                child: SingleChildScrollView(
+                  physics: const AlwaysScrollableScrollPhysics(),
+                  padding: const EdgeInsets.all(16),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 640),
+                      child: KeyedSubtree(
+                        key: ValueKey('$nav-$lang'),
+                        child: _screenFor(nav),
+                      ),
                     ),
                   ),
                 ),
@@ -61,6 +66,17 @@ class MerchantShell extends ConsumerWidget {
         ),
       ),
     );
+  }
+
+  /// Pull-to-refresh: re-fetch live data (no-op in mock mode) and rebuild screens.
+  Future<void> _refresh(WidgetRef ref) async {
+    final repo = ref.read(dashboardRepoProvider);
+    if (repo != null) {
+      try {
+        await repo.hydrate();
+      } catch (_) {}
+    }
+    ref.read(refreshTickProvider.notifier).state++;
   }
 
   Widget _screenFor(String nav) {

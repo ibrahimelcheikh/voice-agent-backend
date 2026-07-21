@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/dashboard_repository.dart';
 import '../l10n/strings.dart';
 import '../state/app_state.dart';
 import '../theme/tokens.dart';
@@ -14,6 +15,8 @@ class OverviewScreen extends ConsumerWidget {
     final lang = ref.watch(languageProvider);
     final s = S.of(lang);
     final rtl = lang == 'ar';
+    ref.watch(refreshTickProvider); // rebuild after a pull-to-refresh / mutation
+    final dash = ref.watch(dashboardRepoProvider);
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -50,9 +53,9 @@ class OverviewScreen extends ConsumerWidget {
         const SizedBox(height: 16),
         KpiCard(icon: Icons.access_time, bg: AppColors.blueSoft, fg: AppColors.blue, label: s.v('staffHours'), value: s.v('val34hours'), sub: s.v('thisMonth')),
         const SizedBox(height: 16),
-        KpiCard(icon: Icons.phone_callback_outlined, bg: AppColors.amberSoft, fg: AppColors.amber, label: s.v('extraCalls'), value: s.v('val118'), sub: s.v('thisMonth')),
+        KpiCard(icon: Icons.phone_callback_outlined, bg: AppColors.amberSoft, fg: AppColors.amber, label: s.v('extraCalls'), value: dash != null ? '${dash.counts['afterHours'] ?? 0}' : s.v('val118'), sub: s.v('thisMonth')),
         const SizedBox(height: 16),
-        KpiCard(icon: Icons.event_available, bg: AppColors.greenSoft, fg: AppColors.green, label: s.v('bookings'), value: s.v('val243'), sub: s.v('thisMonth')),
+        KpiCard(icon: Icons.event_available, bg: AppColors.greenSoft, fg: AppColors.green, label: s.v('bookings'), value: dash != null ? '${dash.counts['appointments'] ?? 0}' : s.v('val243'), sub: s.v('thisMonth')),
         const SizedBox(height: 16),
         _PopularTimes(s: s, rtl: rtl),
         const SizedBox(height: 16),

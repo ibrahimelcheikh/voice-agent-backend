@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app_config.dart';
 import 'data/api_client.dart';
+import 'data/dashboard_repository.dart';
 import 'data/mock_data.dart';
 import 'data/merchant_repository.dart';
 import 'state/app_state.dart';
@@ -14,17 +15,36 @@ import 'screens/auth_gate.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Resolve the backend URL at runtime from web/config.json (no rebuild needed).
-  // Null => no usable backend => stay on bundled mock data (still renders fully).
-  final apiBaseUrl = await AppConfig.resolveApiBaseUrl();
-  final useMock = apiBaseUrl == null;
+  // Resolve runtime config from web/config.json (no rebuild needed).
+  final cfg = await AppConfig.resolve();
+
+  // Real-dashboard mode (no auth): fetch live data for Overview/Conversations/Appointments.
+  // Any failure falls back to bundled mock data so the app always renders.
+  DashboardMerchantRepository? dashRepo;
+  if (cfg.realDashboard) {
+    try {
+      final repo = DashboardMerchantRepository(ApiClient(base: cfg.apiBaseUrl), cfg.tenantSlug!);
+      await repo.hydrate();
+      dashRepo = repo;
+    } catch (_) {
+      dashRepo = null; // -> mock
+    }
+  }
+
+  // Login-gate mode only when a backend is set but real-dashboard is off.
+  final loginMode = cfg.apiBaseUrl != null && !cfg.useRealApi;
+  final useMock = !loginMode; // real-dashboard and mock both render MerchantShell
 
   // Optional deep-linking via query params, e.g.
   // ?lang=ar&nav=settings&tab=voice  or  ?nav=services&service=botox
   final q = Uri.base.queryParameters;
   final overrides = <Override>[];
-  if (apiBaseUrl != null) {
-    overrides.add(apiClientProvider.overrideWith((ref) => ApiClient(base: apiBaseUrl)));
+  if (dashRepo != null) {
+    overrides.add(merchantRepositoryProvider.overrideWith((ref) => dashRepo!));
+    overrides.add(dashboardRepoProvider.overrideWith((ref) => dashRepo));
+  }
+  if (loginMode && cfg.apiBaseUrl != null) {
+    overrides.add(apiClientProvider.overrideWith((ref) => ApiClient(base: cfg.apiBaseUrl)));
   }
   if (q['lang'] == 'ar' || q['lang'] == 'en') {
     overrides.add(languageProvider.overrideWith((ref) => q['lang']!));
