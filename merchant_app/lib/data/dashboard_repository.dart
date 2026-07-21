@@ -21,6 +21,11 @@ class DashboardMerchantRepository implements MerchantRepository {
   /// Overview KPI counts from /summary.
   Map<String, int> counts = const {'calls': 0, 'appointments': 0, 'afterHours': 0};
 
+  /// Settings the agent speaks: per-day hours (keys sat..fri) + greetings.
+  Map<String, String> hoursMap = const {};
+  String? openGreeting;
+  String? closedGreeting;
+
   // ---- reads: real where we have it, mock for the rest ----
   @override
   List<Branch> branches() => kBranches;
@@ -61,12 +66,31 @@ class DashboardMerchantRepository implements MerchantRepository {
     _appts = [for (final m in (a['items'] as List? ?? const [])) _appt(m as Map)];
     final sv = await api.get('/tenants/$slug/services') as Map;
     _services = [for (final m in (sv['items'] as List? ?? const [])) _service(m as Map)];
+    final set = await api.get('/tenants/$slug/settings') as Map;
+    hoursMap = {
+      for (final e in ((set['hours'] as Map?) ?? const {}).entries) '${e.key}': '${e.value}'
+    };
+    openGreeting = set['open_greeting']?.toString();
+    closedGreeting = set['closed_greeting']?.toString();
   }
 
   Future<void> updateService(String id, {String? name, int? price}) async {
     await api.patch('/tenants/$slug/services/$id', {
       if (name != null) 'name': name,
       if (price != null) 'price': price,
+    });
+    await hydrate();
+  }
+
+  Future<void> updateHours(Map<String, String> hours) async {
+    await api.put('/tenants/$slug/hours', {'hours': hours});
+    await hydrate();
+  }
+
+  Future<void> updateGreetings({String? open, String? closed}) async {
+    await api.put('/tenants/$slug/greetings', {
+      if (open != null) 'open_greeting': open,
+      if (closed != null) 'closed_greeting': closed,
     });
     await hydrate();
   }

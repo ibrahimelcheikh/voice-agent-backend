@@ -12,11 +12,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from zoneinfo import ZoneInfo
 
 from app.db.database import get_db
 from app.models.models import (
-    Tenant, Call, Appointment, AppointmentStatus, Patient, Service, CallOutcome,
+    Tenant, Call, Appointment, AppointmentStatus, Patient, Service, CallOutcome, Clinic,
 )
 from app.agents.clinic_functions import book_appointment, _money, _match_service
 
@@ -308,3 +309,79 @@ async def update_service(slug: str, service_id: str, body: ServiceEdit,
         s.duration_minutes = body.duration_minutes
     await db.commit()
     return {"success": True, "id": service_id}
+
+
+# ── Settings: hours + greetings (the agent speaks these) ─────────────────────
+async def _primary_clinic(db: AsyncSession, slug: str) -> Clinic | None:
+    return (await db.execute(
+        select(Clinic).where(Clinic.tenant_id == slug).order_by(Clinic.created_at)
+    )).scalars().first()
+
+
+_DAY_ORDER = ["sat", "sun", "mon", "tue", "wed", "thu", "fri"]
+
+
+def _hours_text(hours: dict) -> str:
+    """A one-line human summary of the week for the FAQ knowledge base."""
+    if not isinstance(hours, dict) or not hours:
+        return ""
+    names = {"sat": "Saturday", "sun": "Sunday", "mon": "Monday", "tue": "Tuesday",
+             "wed": "Wednesday", "thu": "Thursday", "fri": "Friday"}
+    parts = []
+    for d in _DAY_ORDER:
+        v = hours.get(d)
+        if v:
+            parts.append(f"{names[d]}: {v}")
+    return "; ".join(parts)
+
+
+@router.get("/tenants/{slug}/settings")
+async def get_settings(slug: str, db: AsyncSession = Depends(get_db)):
+    t = await _tenant_or_404(db, slug)
+    clinic = await _primary_clinic(db, slug)
+    return {
+        "open_greeting": t.greeting_message,
+        "closed_greeting": t.closed_greeting,
+        "hours": (clinic.hours if clinic else {}) or {},
+    }
+
+
+class GreetingsIn(BaseModel):
+    open_greeting: str | None = None
+    closed_greeting: str | None = None
+
+
+@router.put("/tenants/{slug}/greetings")
+async def put_greetings(slug: str, body: GreetingsIn, db: AsyncSession = Depends(get_db)):
+    t = await _tenant_or_404(db, slug)
+    if body.open_greeting is not None:
+        t.greeting_message = body.open_greeting
+    if body.closed_greeting is not None:
+        t.closed_greeting = body.closed_greeting
+    await db.commit()
+    return {"open_greeting": t.greeting_message, "closed_greeting": t.closed_greeting}
+
+
+class HoursIn(BaseModel):
+    hours: dict
+
+
+@router.put("/tenants/{slug}/hours")
+async def put_hours(slug: str, body: HoursIn, db: AsyncSession = Depends(get_db)):
+    t = await _tenant_or_404(db, slug)
+    clinic = await _primary_clinic(db, slug)
+    if not clinic:
+        clinic = Clinic(tenant_id=slug, name="Main branch", hours=body.hours)
+        db.add(clinic)
+    else:
+        clinic.hours = body.hours
+        flag_modified(clinic, "hours")
+    # Keep the FAQ knowledge base in sync so faq_lookup answers hours consistently.
+    kb = dict(t.knowledge_base or {})
+    summary = _hours_text(body.hours)
+    if summary:
+        kb["hours"] = summary
+        t.knowledge_base = kb
+        flag_modified(t, "knowledge_base")
+    await db.commit()
+    return {"hours": clinic.hours}

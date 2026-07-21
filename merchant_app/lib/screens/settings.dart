@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/dashboard_repository.dart';
 import '../data/merchant_repository.dart';
 import '../data/models.dart';
 import '../l10n/strings.dart';
@@ -75,7 +76,9 @@ class SettingsScreen extends ConsumerWidget {
 }
 
 // ---------- GENERAL ----------
-class _General extends StatelessWidget {
+const _kDayKeys = ['sat', 'sun', 'mon', 'tue', 'wed', 'thu', 'fri'];
+
+class _General extends ConsumerWidget {
   final S s;
   final bool rtl;
   final String lang;
@@ -83,10 +86,23 @@ class _General extends StatelessWidget {
   const _General({required this.s, required this.rtl, required this.lang, required this.branch});
 
   @override
-  Widget build(BuildContext context) {
-    final days = rtl
-        ? ['السبت', 'الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس']
-        : ['Saturday', 'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday'];
+  Widget build(BuildContext context, WidgetRef ref) {
+    ref.watch(refreshTickProvider);
+    final dash = ref.watch(dashboardRepoProvider);
+    final dayNames = rtl
+        ? {'sat': 'السبت', 'sun': 'الأحد', 'mon': 'الإثنين', 'tue': 'الثلاثاء', 'wed': 'الأربعاء', 'thu': 'الخميس', 'fri': 'الجمعة'}
+        : {'sat': 'Saturday', 'sun': 'Sunday', 'mon': 'Monday', 'tue': 'Tuesday', 'wed': 'Wednesday', 'thu': 'Thursday', 'fri': 'Friday'};
+    final hours = <String, String>{
+      'sat': '1:00 PM → 9:00 PM', 'sun': '1:00 PM → 9:00 PM', 'mon': '1:00 PM → 9:00 PM',
+      'tue': '1:00 PM → 9:00 PM', 'wed': '1:00 PM → 9:00 PM', 'thu': '1:00 PM → 9:00 PM', 'fri': 'Closed',
+      if (dash != null) ...dash.hoursMap,
+    };
+    final openGreeting = dash?.openGreeting ?? (rtl
+        ? 'أهلاً بك في عيادة ديفينيا. كيف يمكنني مساعدتك اليوم؟'
+        : 'Hello, welcome to Divinia Clinic. How may I help you today?');
+    final closedGreeting = dash?.closedGreeting ?? (rtl
+        ? 'شكراً لاتصالك بعيادة ديفينيا. نحن مغلقون حالياً، لكن يمكنني تحديد موعد لك ونعاود الاتصال بك في ساعات العمل.'
+        : "Thanks for calling Divinia Clinic. We're currently closed, but I can schedule an appointment for you and we'll follow up during clinic hours.");
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -113,7 +129,10 @@ class _General extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-        SectionTitle(s.v('hours')),
+        Row(children: [
+          Expanded(child: SectionTitle(s.v('hours'))),
+          if (dash != null) _editChip(s, () => _editHours(context, ref, dash, dayNames, hours)),
+        ]),
         const SizedBox(height: 16),
         AppCard(
           padding: const EdgeInsets.all(22),
@@ -122,37 +141,16 @@ class _General extends StatelessWidget {
             children: [
               Text(s.v('hoursSub'), style: const TextStyle(color: AppColors.sub)),
               const SizedBox(height: 16),
-              for (int i = 0; i < days.length; i++)
-                Container(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  decoration: BoxDecoration(border: i == 0 ? null : const Border(top: BorderSide(color: AppColors.line))),
-                  child: Row(children: [
-                    const AppToggle(on: true),
-                    const SizedBox(width: 14),
-                    SizedBox(width: 90, child: Text(days[i], style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.ink))),
-                    const Spacer(),
-                    Pill(bg: AppColors.cardAlt, fg: AppColors.ink, child: hoursRow('1:00 PM → 9:00 PM')),
-                  ]),
-                ),
-              Opacity(
-                opacity: 0.5,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
-                  decoration: const BoxDecoration(border: Border(top: BorderSide(color: AppColors.line))),
-                  child: Row(children: [
-                    const AppToggle(on: false),
-                    const SizedBox(width: 14),
-                    Text(s.v('friday'), style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.ink)),
-                    const Spacer(),
-                    Text(s.v('closed'), style: const TextStyle(color: AppColors.sub, fontWeight: FontWeight.w700)),
-                  ]),
-                ),
-              ),
+              for (int i = 0; i < _kDayKeys.length; i++)
+                _hoursDayRow(i, dayNames[_kDayKeys[i]]!, hours[_kDayKeys[i]] ?? '', s),
             ],
           ),
         ),
         const SizedBox(height: 16),
-        SectionTitle(s.v('greetingMsgs')),
+        Row(children: [
+          Expanded(child: SectionTitle(s.v('greetingMsgs'))),
+          if (dash != null) _editChip(s, () => _editGreetings(context, ref, dash, openGreeting, closedGreeting)),
+        ]),
         const SizedBox(height: 16),
         AppCard(
           padding: const EdgeInsets.all(22),
@@ -163,17 +161,13 @@ class _General extends StatelessWidget {
               const SizedBox(height: 4),
               Text(s.v('openGreetingSub'), style: const TextStyle(color: AppColors.sub)),
               const SizedBox(height: 12),
-              _greetingBox(rtl
-                  ? 'أهلاً بك في عيادة ديفينيا. كيف يمكنني مساعدتك اليوم؟'
-                  : 'Hello, welcome to Divinia Clinic. How may I help you today?'),
+              _greetingBox(openGreeting),
               const Padding(padding: EdgeInsets.symmetric(vertical: 20), child: Divider(color: AppColors.line, height: 1)),
               _greetingTitle(s.v('closedGreeting')),
               const SizedBox(height: 4),
               Text(s.v('closedGreetingSub'), style: const TextStyle(color: AppColors.sub, height: 1.5)),
               const SizedBox(height: 12),
-              _greetingBox(rtl
-                  ? 'شكراً لاتصالك بعيادة ديفينيا. نحن مغلقون حالياً، لكن يمكنني تحديد موعد لك ونعاود الاتصال بك في ساعات العمل.'
-                  : "Thanks for calling Divinia Clinic. We're currently closed, but I can schedule an appointment for you and we'll follow up during clinic hours."),
+              _greetingBox(closedGreeting),
             ],
           ),
         ),
@@ -213,6 +207,119 @@ class _General extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _editChip(S s, VoidCallback onTap) => InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(999),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          decoration: BoxDecoration(color: AppColors.blueSoft, borderRadius: BorderRadius.circular(999)),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.edit, size: 15, color: AppColors.blueDeep),
+            const SizedBox(width: 6),
+            Text(s.v('edit'), style: const TextStyle(color: AppColors.blueDeep, fontWeight: FontWeight.w800, fontSize: 13.5)),
+          ]),
+        ),
+      );
+
+  Widget _hoursDayRow(int i, String name, String value, S s) {
+    final closed = value.isEmpty || value.toLowerCase() == 'closed';
+    return Opacity(
+      opacity: closed ? 0.5 : 1,
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(border: i == 0 ? null : const Border(top: BorderSide(color: AppColors.line))),
+        child: Row(children: [
+          AppToggle(on: !closed),
+          const SizedBox(width: 14),
+          SizedBox(width: 90, child: Text(name, style: const TextStyle(fontWeight: FontWeight.w800, color: AppColors.ink))),
+          const Spacer(),
+          closed
+              ? Text(s.v('closed'), style: const TextStyle(color: AppColors.sub, fontWeight: FontWeight.w700))
+              : Pill(bg: AppColors.cardAlt, fg: AppColors.ink, child: hoursRow(value)),
+        ]),
+      ),
+    );
+  }
+
+  void _editHours(BuildContext context, WidgetRef ref, DashboardMerchantRepository dash,
+      Map<String, String> dayNames, Map<String, String> hours) {
+    final ctrls = {for (final k in _kDayKeys) k: TextEditingController(text: hours[k] ?? '')};
+    showDialog(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.card,
+        title: Text(s.v('hours')),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            for (final k in _kDayKeys)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: TextField(
+                  controller: ctrls[k],
+                  decoration: InputDecoration(labelText: dayNames[k], hintText: '1:00 PM → 9:00 PM / Closed'),
+                ),
+              ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text(s.v('cancel'))),
+          FilledButton(
+            onPressed: () async {
+              Navigator.of(dctx).pop();
+              final updated = {
+                for (final k in _kDayKeys) k: ctrls[k]!.text.trim().isEmpty ? 'Closed' : ctrls[k]!.text.trim()
+              };
+              try {
+                await dash.updateHours(updated);
+                ref.read(refreshTickProvider.notifier).state++;
+              } catch (e) {
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+              }
+            },
+            child: Text(s.v('save')),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _editGreetings(BuildContext context, WidgetRef ref, DashboardMerchantRepository dash,
+      String open, String closed) {
+    final openC = TextEditingController(text: open);
+    final closedC = TextEditingController(text: closed);
+    showDialog(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.card,
+        title: Text(s.v('greetingMsgs')),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(s.v('openGreeting'), style: const TextStyle(fontWeight: FontWeight.w800)),
+            TextField(controller: openC, maxLines: 3),
+            const SizedBox(height: 14),
+            Text(s.v('closedGreeting'), style: const TextStyle(fontWeight: FontWeight.w800)),
+            TextField(controller: closedC, maxLines: 3),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text(s.v('cancel'))),
+          FilledButton(
+            onPressed: () async {
+              Navigator.of(dctx).pop();
+              try {
+                await dash.updateGreetings(open: openC.text.trim(), closed: closedC.text.trim());
+                ref.read(refreshTickProvider.notifier).state++;
+              } catch (e) {
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+              }
+            },
+            child: Text(s.v('save')),
+          ),
+        ],
+      ),
     );
   }
 
