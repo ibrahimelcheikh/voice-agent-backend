@@ -109,6 +109,7 @@ class DashboardMerchantRepository implements MerchantRepository {
       sentiment: urgent ? 'Urgent' : 'Positive',
       dur: _dur(m['duration_seconds']),
       urgent: urgent,
+      transcript: (m['transcript'] ?? '').toString(),
     );
   }
 

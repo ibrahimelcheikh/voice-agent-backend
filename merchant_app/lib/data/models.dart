@@ -58,6 +58,7 @@ class Convo {
   final String sentiment;
   final String dur;
   final bool urgent;
+  final String? transcript; // full Caller/Agent dialogue (real calls)
   const Convo({
     required this.name,
     required this.phone,
@@ -70,6 +71,7 @@ class Convo {
     required this.sentiment,
     required this.dur,
     this.urgent = false,
+    this.transcript,
   });
 }
 

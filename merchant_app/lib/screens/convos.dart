@@ -179,6 +179,8 @@ class _ConvoCardState extends State<_ConvoCard> {
                 ),
               ),
             Text(c.summary, style: const TextStyle(color: AppColors.sub, height: 1.6, fontSize: 15)),
+            if ((c.transcript ?? '').isNotEmpty && c.transcript != c.summary)
+              _TranscriptExpander(text: c.transcript!, label: s.v('viewTranscript')),
             const SizedBox(height: 14),
             Wrap(
               spacing: 10,
@@ -347,4 +349,46 @@ class _DateRangeDialog extends StatelessWidget {
           child: Text(label, style: TextStyle(fontWeight: FontWeight.w800, color: fg)),
         ),
       );
+}
+
+/// Collapsible full call transcript shown under the AI summary.
+class _TranscriptExpander extends StatefulWidget {
+  const _TranscriptExpander({required this.text, required this.label});
+  final String text;
+  final String label;
+  @override
+  State<_TranscriptExpander> createState() => _TranscriptExpanderState();
+}
+
+class _TranscriptExpanderState extends State<_TranscriptExpander> {
+  bool open = false;
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: 10),
+        InkWell(
+          onTap: () => setState(() => open = !open),
+          borderRadius: BorderRadius.circular(8),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(open ? Icons.expand_less : Icons.expand_more, size: 18, color: AppColors.blue),
+              const SizedBox(width: 4),
+              Text(widget.label, style: const TextStyle(color: AppColors.blue, fontWeight: FontWeight.w800, fontSize: 14)),
+            ]),
+          ),
+        ),
+        if (open)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.only(top: 6),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(color: AppColors.cardAlt, borderRadius: BorderRadius.circular(12)),
+            child: Text(widget.text, style: const TextStyle(color: AppColors.ink, height: 1.55, fontSize: 14.5)),
+          ),
+      ],
+    );
+  }
 }
