@@ -87,21 +87,32 @@ async def _match_doctor(db, doctor: str, tenant_id=None, clinic_id=None):
     return None
 
 
+def _service_aliases(s) -> list[str]:
+    """All names a caller might use for a service — the English name, the category, and the
+    Arabic name (from details['ar']), lower-cased. Lets an Arabic caller say 'بوتوكس' and still
+    link the 'Botox' row."""
+    names = [s.name or "", s.category or ""]
+    d = s.details if isinstance(s.details, dict) else {}
+    if d.get("ar"):
+        names.append(str(d["ar"]))
+    return [n.strip().lower() for n in names if n and n.strip()]
+
+
 async def _match_service(db, name: str, tenant_id=None):
-    """Resolve a spoken service/treatment to a real Service row (name match, case-insensitive,
-    exact then substring either direction). Returns None when nothing matches or no name given —
-    booking still succeeds without a linked service, and the agent never invents one."""
+    """Resolve a spoken service/treatment to a real Service row, matching the English OR Arabic
+    name (exact, then substring either direction). Returns None when nothing matches or no name
+    is given — booking still succeeds without a linked service, and the agent never invents one."""
     if not name:
         return None
     needle = name.strip().lower()
     services = (await db.execute(_scope(select(Service), Service, tenant_id))).scalars().all()
     for s in services:
-        if s.name.lower() == needle:
+        if needle in _service_aliases(s):
             return s
     for s in services:
-        n = s.name.lower()
-        if needle in n or n in needle:
-            return s
+        for alias in _service_aliases(s):
+            if needle in alias or alias in needle:
+                return s
     return None
 
 
