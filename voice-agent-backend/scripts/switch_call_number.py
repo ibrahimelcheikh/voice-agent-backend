@@ -25,13 +25,13 @@ from app.models.models import Tenant, Niche
 from app.db.seed_atlasprimex import _DIVINIA_KB, DIVINIA_ID
 
 
+# The live callable Twilio DID for the demo (confirmed: reassign from Beirut Bites to Divinia).
+# Override with CALLABLE_NUMBER if this ever changes.
+DEFAULT_CALLABLE_NUMBER = "+16575347796"
+
+
 def _target_number() -> str:
-    n = (os.environ.get("CALLABLE_NUMBER") or "").strip()
-    if not n:
-        print("ERROR: set CALLABLE_NUMBER to the Twilio number callers dial, e.g.\n"
-              "  CALLABLE_NUMBER=+16575347796 python -m scripts.switch_call_number divinia")
-        sys.exit(2)
-    return n
+    return (os.environ.get("CALLABLE_NUMBER") or DEFAULT_CALLABLE_NUMBER).strip()
 
 
 async def _free_number(db, number: str, keep_id: str | None):
