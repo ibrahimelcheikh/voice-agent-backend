@@ -263,3 +263,48 @@ async def delete_appointment(slug: str, appt_id: str, db: AsyncSession = Depends
     await db.delete(appt)
     await db.commit()
     return {"success": True, "id": appt_id}
+
+
+# ── Services (list / edit — the agent quotes these live) ─────────────────────
+@router.get("/tenants/{slug}/services")
+async def list_services(slug: str, db: AsyncSession = Depends(get_db)):
+    t = await _tenant_or_404(db, slug)
+    currency = (t.config or {}).get("currency")
+    rows = (await db.execute(
+        select(Service).where(Service.tenant_id == slug).order_by(Service.name)
+    )).scalars().all()
+    return {"items": [{
+        "id": s.id,
+        "name": s.name,
+        "category": s.category,
+        "duration_minutes": s.duration_minutes,
+        "price": s.price,
+        "price_display": _money(s.price, currency),
+        "details": s.details or {},
+    } for s in rows]}
+
+
+class ServiceEdit(BaseModel):
+    name: str | None = None
+    price: int | None = None
+    category: str | None = None
+    duration_minutes: int | None = None
+
+
+@router.patch("/tenants/{slug}/services/{service_id}")
+async def update_service(slug: str, service_id: str, body: ServiceEdit,
+                         db: AsyncSession = Depends(get_db)):
+    await _tenant_or_404(db, slug)
+    s = await db.get(Service, service_id)
+    if not s or s.tenant_id != slug:
+        raise HTTPException(status_code=404, detail="service not found")
+    if body.name is not None:
+        s.name = body.name
+    if body.price is not None:
+        s.price = body.price
+    if body.category is not None:
+        s.category = body.category
+    if body.duration_minutes is not None:
+        s.duration_minutes = body.duration_minutes
+    await db.commit()
+    return {"success": True, "id": service_id}

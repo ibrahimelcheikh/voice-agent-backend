@@ -16,6 +16,7 @@ class DashboardMerchantRepository implements MerchantRepository {
 
   List<Convo> _convos = const [];
   List<Appt> _appts = const [];
+  List<Service> _services = const [];
 
   /// Overview KPI counts from /summary.
   Map<String, int> counts = const {'calls': 0, 'appointments': 0, 'afterHours': 0};
@@ -24,10 +25,10 @@ class DashboardMerchantRepository implements MerchantRepository {
   @override
   List<Branch> branches() => kBranches;
   @override
-  List<Service> services() => kServices;
+  List<Service> services() => _services.isNotEmpty ? _services : kServices;
   @override
   Service? serviceById(String id) {
-    for (final s in kServices) {
+    for (final s in services()) {
       if (s.id == id) return s;
     }
     return null;
@@ -58,6 +59,16 @@ class DashboardMerchantRepository implements MerchantRepository {
     _convos = [for (final m in (c['items'] as List? ?? const [])) _convo(m as Map)];
     final a = await api.get('/tenants/$slug/appointments') as Map;
     _appts = [for (final m in (a['items'] as List? ?? const [])) _appt(m as Map)];
+    final sv = await api.get('/tenants/$slug/services') as Map;
+    _services = [for (final m in (sv['items'] as List? ?? const [])) _service(m as Map)];
+  }
+
+  Future<void> updateService(String id, {String? name, int? price}) async {
+    await api.patch('/tenants/$slug/services/$id', {
+      if (name != null) 'name': name,
+      if (price != null) 'price': price,
+    });
+    await hydrate();
   }
 
   // ---- mutations (each re-hydrates so the UI reflects the truth) ----
@@ -126,6 +137,35 @@ class DashboardMerchantRepository implements MerchantRepository {
       status: m['status']?.toString(),
       phone: m['phone']?.toString(),
       price: m['price']?.toString(),
+    );
+  }
+
+  Service _service(Map m) {
+    final det = (m['details'] is Map) ? (m['details'] as Map) : const {};
+    LMap lm(dynamic v) => v is Map
+        ? {'en': (v['en'] ?? '').toString(), 'ar': (v['ar'] ?? '').toString()}
+        : {'en': '', 'ar': ''};
+    final tiers = <Tier>[];
+    for (final tr in (det['tiers'] as List? ?? const [])) {
+      if (tr is Map) {
+        tiers.add(Tier(
+          {'en': (tr['en'] ?? '').toString(), 'ar': (tr['ar'] ?? '').toString()},
+          _int(tr['price']),
+        ));
+      }
+    }
+    final name = (m['name'] ?? '').toString();
+    return Service(
+      id: (m['id'] ?? '').toString(),
+      en: name,
+      ar: (det['ar'] ?? name).toString(),
+      cat: (m['category'] ?? '').toString(),
+      price: _int(m['price']),
+      dur: _int(m['duration_minutes']),
+      about: lm(det['about']),
+      tiers: tiers,
+      prep: lm(det['prep']),
+      after: lm(det['after']),
     );
   }
 

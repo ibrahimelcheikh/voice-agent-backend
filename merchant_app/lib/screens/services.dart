@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../data/dashboard_repository.dart';
 import '../data/merchant_repository.dart';
 import '../data/models.dart';
 import '../l10n/strings.dart';
@@ -22,6 +23,7 @@ class _ServicesScreenState extends ConsumerState<ServicesScreen> {
     final lang = ref.watch(languageProvider);
     final s = S.of(lang);
     final rtl = lang == 'ar';
+    ref.watch(refreshTickProvider); // rebuild after a service edit
     final open = ref.watch(serviceOpenProvider);
     final repo = ref.read(merchantRepositoryProvider);
 
@@ -199,12 +201,29 @@ class _ServiceDetail extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final dash = ref.watch(dashboardRepoProvider);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         BackLink(label: s.v('back'), rtl: rtl, onTap: () => ref.read(serviceOpenProvider.notifier).state = null),
         const SizedBox(height: 16),
-        Text(svc.name(lang), style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: AppColors.ink)),
+        Row(children: [
+          Expanded(child: Text(svc.name(lang), style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: AppColors.ink))),
+          if (dash != null && svc.id.isNotEmpty)
+            InkWell(
+              onTap: () => _edit(context, ref, dash),
+              borderRadius: BorderRadius.circular(999),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                decoration: BoxDecoration(color: AppColors.blueSoft, borderRadius: BorderRadius.circular(999)),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.edit, size: 16, color: AppColors.blueDeep),
+                  const SizedBox(width: 6),
+                  Text(s.v('edit'), style: const TextStyle(color: AppColors.blueDeep, fontWeight: FontWeight.w800)),
+                ]),
+              ),
+            ),
+        ]),
         const SizedBox(height: 8),
         Wrap(spacing: 8, runSpacing: 8, children: [
           Pill(bg: AppColors.blueSoft, fg: AppColors.blueDeep, child: Text(svc.cat)),
@@ -289,6 +308,47 @@ class _ServiceDetail extends ConsumerWidget {
                 Text(body, style: const TextStyle(color: AppColors.sub, height: 1.55, fontSize: 14.5)),
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _edit(BuildContext context, WidgetRef ref, DashboardMerchantRepository dash) {
+    final nameC = TextEditingController(text: svc.en);
+    final priceC = TextEditingController(text: '${svc.price}');
+    showDialog(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.card,
+        title: Text('${s.v('edit')} — ${svc.name(lang)}'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: nameC, decoration: InputDecoration(labelText: s.v('fService'))),
+          TextField(
+            controller: priceC,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Price (SAR)'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text(s.v('cancel'))),
+          FilledButton(
+            onPressed: () async {
+              Navigator.of(dctx).pop();
+              try {
+                await dash.updateService(
+                  svc.id,
+                  name: nameC.text.trim().isEmpty ? null : nameC.text.trim(),
+                  price: int.tryParse(priceC.text.trim()),
+                );
+                ref.read(refreshTickProvider.notifier).state++;
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+                }
+              }
+            },
+            child: Text(s.v('save')),
           ),
         ],
       ),
