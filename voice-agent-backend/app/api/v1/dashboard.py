@@ -18,7 +18,7 @@ from app.db.database import get_db
 from app.models.models import (
     Tenant, Call, Appointment, AppointmentStatus, Patient, Service, CallOutcome,
 )
-from app.agents.clinic_functions import book_appointment, _money
+from app.agents.clinic_functions import book_appointment, _money, _match_service
 
 router = APIRouter()
 
@@ -124,7 +124,8 @@ async def conversations(slug: str, limit: int = 40, db: AsyncSession = Depends(g
 # ── Appointments (list / create / delete) ────────────────────────────────────
 def _serialize_appt(a: Appointment, patient: Patient | None, svc: Service | None, currency) -> dict:
     status = a.status.value if a.status else "booked"
-    if (a.reminder_outcome or "").lower() == "rescheduled":
+    # A date/time change surfaces as "rescheduled" — but a cancelled/completed appt keeps that status.
+    if status not in ("cancelled", "completed") and (a.reminder_outcome or "").lower() == "rescheduled":
         status = "rescheduled"
     return {
         "id": a.id,
@@ -177,6 +178,56 @@ async def create_appointment(slug: str, body: NewAppointment, db: AsyncSession =
     appt = await db.get(Appointment, res["appointment_id"])
     patient = await db.get(Patient, appt.patient_id) if appt and appt.patient_id else None
     svc = await db.get(Service, appt.service_id) if appt and appt.service_id else None
+    return _serialize_appt(appt, patient, svc, currency)
+
+
+class EditAppointment(BaseModel):
+    date: str | None = None       # YYYY-MM-DD
+    time: str | None = None       # HH:MM
+    service: str | None = None
+    status: str | None = None     # booked | confirmed | cancelled | completed | rescheduled
+
+
+_STATUS_MAP = {
+    "booked": AppointmentStatus.booked, "confirmed": AppointmentStatus.confirmed,
+    "cancelled": AppointmentStatus.cancelled, "canceled": AppointmentStatus.cancelled,
+    "completed": AppointmentStatus.completed,
+}
+
+
+@router.patch("/tenants/{slug}/appointments/{appt_id}")
+async def modify_appointment(slug: str, appt_id: str, body: EditAppointment,
+                             db: AsyncSession = Depends(get_db)):
+    t = await _tenant_or_404(db, slug)
+    appt = await db.get(Appointment, appt_id)
+    if not appt or appt.tenant_id != slug:
+        raise HTTPException(status_code=404, detail="appointment not found")
+
+    moved = False
+    if body.date and body.date != appt.date:
+        appt.date = body.date
+        moved = True
+    if body.time and body.time != appt.time:
+        appt.time = body.time
+        moved = True
+    if body.service:
+        svc = await _match_service(db, body.service, slug)
+        if svc:
+            appt.service_id = svc.id
+    if body.status:
+        st = (body.status or "").lower()
+        if st == "rescheduled":
+            moved = True
+        elif st in _STATUS_MAP:
+            appt.status = _STATUS_MAP[st]
+    # Surface a date/time change as "rescheduled" in the list (no enum value needed).
+    if moved and appt.status not in (AppointmentStatus.cancelled, AppointmentStatus.completed):
+        appt.reminder_outcome = "rescheduled"
+    await db.commit()
+
+    currency = (t.config or {}).get("currency")
+    patient = await db.get(Patient, appt.patient_id) if appt.patient_id else None
+    svc = await db.get(Service, appt.service_id) if appt.service_id else None
     return _serialize_appt(appt, patient, svc, currency)
 
 
