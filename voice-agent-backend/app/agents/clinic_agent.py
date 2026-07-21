@@ -504,7 +504,7 @@ def _build_session(behavior_config: dict):
     return AgentSession(**session_kwargs)
 
 
-def _wire_session_logging(session) -> None:
+def _wire_session_logging(session, transcript=None) -> None:
     """Log every pipeline stage to the Railway stream so a stall is visible end-to-end:
     who's speaking, STT results, committed messages, per-stage latency (EOU / LLM TTFT /
     TTS TTFB via metrics), and errors. On a pipeline error, best-effort speak an apology
@@ -557,6 +557,12 @@ def _wire_session_logging(session) -> None:
         text = getattr(item, "text_content", "")
         icon = "💬" if role == "assistant" else "🗣️"
         logger.info("%s %s: %r", icon, role, text)
+        # Accumulate the dialogue so it can be persisted as the call transcript. Only real
+        # caller/agent turns land here (the IVR menu is add_to_chat_ctx=False), so this is a
+        # clean transcript of the conversation.
+        if transcript is not None and text and role in ("user", "assistant"):
+            speaker = "Caller" if role == "user" else "Agent"
+            transcript.append(f"{speaker}: {text}")
 
     @session.on("metrics_collected")
     def _on_metrics(ev):
@@ -924,7 +930,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
             language_prompt = None
 
     max_duration = int((behavior_config or {}).get("max_call_duration") or 300)  # 5 min cap
-    state = {"language": "en", "entities": {}}
+    state = {"language": "en", "entities": {}, "transcript": []}
     end_reason = {"r": None}
     done = asyncio.Event()
 
@@ -940,7 +946,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
         state.update(snap)
 
     session = _build_session(behavior_config or {})
-    _wire_session_logging(session)
+    _wire_session_logging(session, transcript=state["transcript"])
 
     if reminder:
         instructions = REMINDER_SYSTEM_PROMPT
@@ -1326,6 +1332,11 @@ async def _close_call(call_id, state, reason, started_at):
             call.ended_at = datetime.utcnow()
             call.duration_seconds = int((call.ended_at - started_at).total_seconds())
             call.language = state.get("language", "en")
+            # Persist the conversation transcript captured turn-by-turn during the call, so the
+            # dashboard can show what was said (and derive a summary from it).
+            lines = state.get("transcript") or []
+            if lines:
+                call.transcript = "\n".join(lines)
             data = dict(call.extracted_data or {})
             data.update(state.get("entities", {}))
             data["end_reason"] = reason
