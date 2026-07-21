@@ -22,7 +22,7 @@ from sqlalchemy import select, desc, func as safunc
 from app.db.database import AsyncSessionLocal
 from app.core.tenant_scope import scope_query as _scope, require_tenant_id
 from app.models.models import (
-    Clinic, Doctor, Service, Patient, Appointment, InsuranceProvider,
+    Tenant, Clinic, Doctor, Service, Patient, Appointment, InsuranceProvider,
     AppointmentStatus,
 )
 
@@ -42,6 +42,22 @@ def _dollars(cents) -> str:
         return f"${int(cents) / 100:.2f}"
     except (TypeError, ValueError):
         return "$0.00"
+
+
+def _money(amount, currency: str | None) -> str:
+    """Format a service price for the tenant's currency.
+
+    Convention: a tenant that declares a non-USD `currency` in its config stores prices as
+    WHOLE units of that currency (e.g. Divinia: 900 -> "900 SAR"). Tenants with no currency
+    keep the legacy USD-cents convention ("$9.00"), so existing clinics/restaurants are
+    unaffected."""
+    cur = (currency or "").strip().upper()
+    if cur and cur not in ("USD", "$"):
+        try:
+            return f"{int(amount):,} {cur}"
+        except (TypeError, ValueError):
+            return f"0 {cur}"
+    return _dollars(amount)
 
 
 async def _clinic(db, tenant_id=None) -> Clinic | None:
@@ -71,9 +87,27 @@ async def _match_doctor(db, doctor: str, tenant_id=None, clinic_id=None):
     return None
 
 
+async def _match_service(db, name: str, tenant_id=None):
+    """Resolve a spoken service/treatment to a real Service row (name match, case-insensitive,
+    exact then substring either direction). Returns None when nothing matches or no name given —
+    booking still succeeds without a linked service, and the agent never invents one."""
+    if not name:
+        return None
+    needle = name.strip().lower()
+    services = (await db.execute(_scope(select(Service), Service, tenant_id))).scalars().all()
+    for s in services:
+        if s.name.lower() == needle:
+            return s
+    for s in services:
+        n = s.name.lower()
+        if needle in n or n in needle:
+            return s
+    return None
+
+
 # ── 1. Book ──────────────────────────────────────────────────────────────────
 
-async def book_appointment(patient_name=None, phone=None, doctor=None, date=None,
+async def book_appointment(patient_name=None, phone=None, doctor=None, service=None, date=None,
                            time=None, reason=None, tenant_id=None) -> dict:
     require_tenant_id(tenant_id, "book_appointment")
     async with AsyncSessionLocal() as db:
@@ -86,6 +120,10 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, date=None
         doc = await _match_doctor(db, doctor, tenant_id, clinic.id if clinic else None)
         if doctor and not doc:
             return {"success": False, "reason": "doctor_not_found", "requested_doctor": doctor}
+
+        # Link the booked treatment when the caller named one (so the dashboard shows
+        # service + price). Unmatched/blank service just leaves service_id NULL — never fails.
+        svc = await _match_service(db, service, tenant_id)
 
         # Find or create the patient by phone — scoped to the tenant so the same number
         # at two different businesses stays two distinct patients.
@@ -103,6 +141,7 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, date=None
             clinic_id=clinic.id if clinic else None,
             patient_id=patient.id,
             doctor_id=doc.id if doc else None,
+            service_id=svc.id if svc else None,
             date=date, time=time,
             status=AppointmentStatus.booked,
             reason=reason,
@@ -116,6 +155,7 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, date=None
             "patient_name": patient.name,
             "doctor": doc.name if doc else None,
             "specialty": doc.specialty if doc else None,
+            "service": svc.name if svc else None,
             "date": date,
             "time": time,
             "reason": reason,
@@ -286,13 +326,15 @@ async def get_services(tenant_id=None) -> dict:
     require_tenant_id(tenant_id, "get_services")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
+        tenant = await db.get(Tenant, tenant_id)
+        currency = (tenant.config or {}).get("currency") if tenant else None
         services = (await db.execute(
             _scope(select(Service), Service, tenant_id).order_by(Service.name)
         )).scalars().all()
         return {"success": True, "clinic": clinic.name if clinic else None,
                 "services": [
                     {"name": s.name, "duration_minutes": s.duration_minutes,
-                     "price": _dollars(s.price), "description": s.description}
+                     "price": _money(s.price, currency), "description": s.description}
                     for s in services]}
 
 

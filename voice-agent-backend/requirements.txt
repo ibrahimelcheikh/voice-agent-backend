@@ -20,6 +20,7 @@ livekit-plugins-openai
 livekit-plugins-silero
 livekit-plugins-deepgram
 livekit-plugins-cartesia
+livekit-plugins-elevenlabs
 livekit-plugins-turn-detector
 pipecat-ai[silero,openai,deepgram,livekit]
 deepgram-sdk

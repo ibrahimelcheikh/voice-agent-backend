@@ -37,6 +37,8 @@ _P = {
     "customer_name": {"type": "string", "description": "The caller's name."},
     "phone": {"type": "string", "description": "Digits only if given."},
     "doctor": {"type": "string", "description": "Doctor name or specialty mentioned."},
+    "service": {"type": "string", "description": "The treatment/service the caller wants to "
+                "book (e.g. Botox, HydraFacial, Laser Hair Removal)."},
     "date": {"type": "string", "description": "Resolved date, YYYY-MM-DD."},
     "time": {"type": "string", "description": "Resolved time, 24h HH:MM."},
     "new_date": {"type": "string", "description": "Reschedule target date, YYYY-MM-DD."},
@@ -132,7 +134,7 @@ def _with_faq(functions: dict, function_args: dict):
 _CLINIC_FUNCS, _CLINIC_ARGS = _with_faq(
     CLINIC_FUNCTIONS,
     {
-        "book_appointment": ["patient_name", "phone", "doctor", "date", "time", "reason"],
+        "book_appointment": ["patient_name", "phone", "doctor", "service", "date", "time", "reason"],
         "cancel_appointment": ["phone", "appointment_id"],
         "reschedule_appointment": ["phone", "new_date", "new_time", "appointment_id"],
         "confirm_appointment": ["phone", "appointment_id"],
@@ -154,7 +156,7 @@ CLINIC_SPEC = NicheSpec(
         "services_offered", "doctor_availability", "insurance_question",
     ],
     entity_props={k: _P[k] for k in (
-        "patient_name", "phone", "doctor", "date", "time", "new_date", "new_time",
+        "patient_name", "phone", "doctor", "service", "date", "time", "new_date", "new_time",
         "reason", "appointment_id", "insurance_provider", "query")},
     function_args=_CLINIC_ARGS,
     actionable={"book_appointment", "cancel_appointment", "reschedule_appointment",

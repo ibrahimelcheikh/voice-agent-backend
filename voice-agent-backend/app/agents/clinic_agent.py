@@ -58,6 +58,7 @@ for _k, _v in {
     "OPENAI_API_KEY": settings.OPENAI_API_KEY,
     "DEEPGRAM_API_KEY": settings.DEEPGRAM_API_KEY,
     "CARTESIA_API_KEY": settings.CARTESIA_API_KEY,
+    "ELEVENLABS_API_KEY": settings.ELEVENLABS_API_KEY,
 }.items():
     if _v and not os.environ.get(_k):
         os.environ[_k] = _v
@@ -224,6 +225,14 @@ def _build_tts(behavior_config: dict):
     provider = (settings.TTS_PROVIDER or "deepgram").lower()
     voice = behavior_config.get("voice_id") or "shimmer"
 
+    if provider == "elevenlabs" and settings.ELEVENLABS_API_KEY:
+        try:
+            tts = _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_EN or None)
+            _log(f"TTS: ElevenLabs {settings.ELEVENLABS_MODEL} (streaming, multilingual)")
+            return tts
+        except Exception as e:
+            _log(f"ElevenLabs TTS unavailable ({type(e).__name__}: {e}); trying Deepgram")
+
     if provider == "cartesia" and settings.CARTESIA_API_KEY:
         try:
             from livekit.plugins import cartesia
@@ -236,7 +245,7 @@ def _build_tts(behavior_config: dict):
         except Exception as e:
             _log(f"Cartesia TTS unavailable ({type(e).__name__}: {e}); trying Deepgram")
 
-    if provider in ("deepgram", "cartesia") and settings.DEEPGRAM_API_KEY:
+    if provider in ("deepgram", "cartesia", "elevenlabs") and settings.DEEPGRAM_API_KEY:
         try:
             from livekit.plugins import deepgram
             _log(f"TTS: Deepgram {settings.DEEPGRAM_TTS_MODEL} (streaming, ENGLISH-ONLY — "
@@ -271,6 +280,65 @@ def _arabic_greeting(business_name: str | None) -> str:
     if business_name:
         return f"مرحباً بكم في {business_name}. أنا المساعد الآلي، كيف يمكنني مساعدتكم اليوم؟"
     return "مرحباً بكم. أنا المساعد الآلي، كيف يمكنني مساعدتكم اليوم؟"
+
+
+def _elevenlabs_tts(voice_id: str | None, *, language: str | None = None):
+    """Construct a LiveKit ElevenLabs TTS, tolerant of plugin-version kwarg differences
+    (newer plugins take model=/voice_id=/language=; older take model_id=/voice=). Raises if
+    the plugin genuinely can't be built so callers can fall back to another provider."""
+    from livekit.plugins import elevenlabs
+    model = settings.ELEVENLABS_MODEL or "eleven_turbo_v2_5"
+    base = {"api_key": settings.ELEVENLABS_API_KEY}
+    attempts = []
+    a1 = dict(base, model=model)
+    if voice_id:
+        a1["voice_id"] = voice_id
+    if language:
+        a1["language"] = language
+    attempts.append(a1)
+    a2 = dict(base, model=model)          # drop language (some models reject it)
+    if voice_id:
+        a2["voice_id"] = voice_id
+    attempts.append(a2)
+    a3 = dict(base, model_id=model)       # legacy kwarg names
+    if voice_id:
+        a3["voice"] = voice_id
+    attempts.append(a3)
+    last = None
+    for kw in attempts:
+        try:
+            return elevenlabs.TTS(**kw)
+        except TypeError as e:
+            last = e
+    raise last or RuntimeError("ElevenLabs TTS construction failed")
+
+
+def _build_elevenlabs_ar_tts():
+    """Per-call ElevenLabs TTS for Arabic, mirroring _build_cartesia_ar_tts: returns None
+    (Arabic falls back to the English path) unless a key AND an Arabic voice id are set, so a
+    missing id never breaks a live call. The multilingual model (eleven_turbo/flash_v2_5)
+    speaks Arabic; ELEVENLABS_VOICE_ID_AR chooses the Arabic female voice."""
+    if not settings.ELEVENLABS_API_KEY:
+        _log("Arabic TTS: no ELEVENLABS_API_KEY — Arabic callers fall back to the English path")
+        return None
+    if not settings.ELEVENLABS_VOICE_ID_AR:
+        _log("Arabic TTS: ELEVENLABS_VOICE_ID_AR not set — NOT guessing a voice id; Arabic "
+             "callers fall back to English until an Arabic voice id is configured")
+        return None
+    try:
+        _log(f"Arabic TTS: ElevenLabs {settings.ELEVENLABS_MODEL} voice={settings.ELEVENLABS_VOICE_ID_AR}")
+        return _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_AR, language="ar")
+    except Exception as e:
+        _log(f"Arabic ElevenLabs TTS unavailable ({type(e).__name__}: {e}); Arabic falls back to English")
+        return None
+
+
+def _build_ar_tts():
+    """Pick the Arabic TTS builder matching TTS_PROVIDER. Any provider that yields None means
+    Arabic safely stays on the English pipeline."""
+    if (settings.TTS_PROVIDER or "").lower() == "elevenlabs":
+        return _build_elevenlabs_ar_tts()
+    return _build_cartesia_ar_tts()
 
 
 def _build_cartesia_ar_tts():
@@ -749,7 +817,7 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
     ar_greeting = None
     ar_stt = None
     if multi_language and "ar" in languages:
-        ar_tts = _build_cartesia_ar_tts()
+        ar_tts = _build_ar_tts()
         if ar_tts is not None:
             ar_greeting = _arabic_greeting((behavior_config or {}).get("business_name"))
             # Phase 3b: Arabic speech-IN uses Deepgram nova-3 language=ar-LB (Lebanese; NOT multi).
