@@ -108,13 +108,18 @@ async def conversations(slug: str, limit: int = 40, db: AsyncSession = Depends(g
                     svc = await db.get(Service, appt.service_id)
                     if svc:
                         booking = {"service": svc.name, "price": _money(svc.price, currency)}
+        transcript = c.transcript or ""
+        ai_summary = (c.ai_analysis or {}).get("summary")
+        # Prefer the AI summary; fall back to the first line/slice of the transcript.
+        summary = ai_summary or (transcript.split("\n")[0] if transcript else "")
         items.append({
             "id": c.id,
             "caller_number": c.caller_number,
             "time": c.started_at.isoformat() if c.started_at else None,
             "language": c.language,
             "duration_seconds": c.duration_seconds,
-            "summary": c.transcript or "",
+            "summary": summary,
+            "transcript": transcript,
             "urgent": bool(c.outcome and c.outcome == CallOutcome.escalated),
             "booking": booking,
         })

@@ -1318,6 +1318,33 @@ async def _create_call_record(tenant_id, config, room_name, caller):
         return None
 
 
+async def _summarize_transcript(text: str) -> str | None:
+    """One-sentence AI summary of the call (best-effort). Runs at call end, so its latency
+    never affects the caller. Returns None on any failure (the transcript still stands)."""
+    if not text or not text.strip():
+        return None
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            max_tokens=60,
+            timeout=8,
+            messages=[
+                {"role": "system", "content":
+                    "Summarize this clinic phone call in ONE short sentence (max 20 words): what the "
+                    "caller wanted and the outcome (booking / reschedule / cancel / question / urgent "
+                    "escalation). No preamble, no quotes."},
+                {"role": "user", "content": text[:4000]},
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip() or None
+    except Exception as e:
+        print(f"[agent] summarize failed: {type(e).__name__}: {e}")
+        return None
+
+
 async def _close_call(call_id, state, reason, started_at):
     """Persist outcome, duration, detected language, and extracted data."""
     if not call_id:
@@ -1337,6 +1364,11 @@ async def _close_call(call_id, state, reason, started_at):
             lines = state.get("transcript") or []
             if lines:
                 call.transcript = "\n".join(lines)
+                summary = await _summarize_transcript(call.transcript)
+                if summary:
+                    ai = dict(call.ai_analysis or {})
+                    ai["summary"] = summary
+                    call.ai_analysis = ai
             data = dict(call.extracted_data or {})
             data.update(state.get("entities", {}))
             data["end_reason"] = reason
