@@ -216,6 +216,32 @@ def _build_stt():
     return openai.STT(model="whisper-1", detect_language=True, api_key=settings.OPENAI_API_KEY)
 
 
+def _cartesia_tts_obj():
+    """A Cartesia TTS instance (multilingual), or None if unavailable. Used as a fail-over."""
+    if not settings.CARTESIA_API_KEY:
+        return None
+    try:
+        from livekit.plugins import cartesia
+        kwargs = {"model": settings.CARTESIA_TTS_MODEL or "sonic-2", "api_key": settings.CARTESIA_API_KEY}
+        if settings.CARTESIA_VOICE:
+            kwargs["voice"] = settings.CARTESIA_VOICE
+        return cartesia.TTS(**kwargs)
+    except Exception:
+        return None
+
+
+def _deepgram_tts_obj():
+    """A Deepgram TTS instance (English-only), or None if unavailable. Last-resort fail-over."""
+    if not settings.DEEPGRAM_API_KEY:
+        return None
+    try:
+        from livekit.plugins import deepgram
+        return deepgram.TTS(model=settings.DEEPGRAM_TTS_MODEL or "aura-asteria-en",
+                            api_key=settings.DEEPGRAM_API_KEY)
+    except Exception:
+        return None
+
+
 def _build_tts(behavior_config: dict):
     """Pick the fastest available streaming TTS.
 
@@ -226,12 +252,25 @@ def _build_tts(behavior_config: dict):
     voice = behavior_config.get("voice_id") or "shimmer"
 
     if provider == "elevenlabs" and settings.ELEVENLABS_API_KEY:
+        primary = None
         try:
-            tts = _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_EN or None)
-            _log(f"TTS: ElevenLabs {settings.ELEVENLABS_MODEL} (streaming, multilingual)")
-            return tts
+            primary = _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_EN or None)
+            _log(f"TTS: ElevenLabs {settings.ELEVENLABS_MODEL} (primary)")
         except Exception as e:
             _log(f"ElevenLabs TTS unavailable ({type(e).__name__}: {e}); trying Deepgram")
+        if primary is not None:
+            # Wrap ElevenLabs with a fast fail-over so a provider error (e.g. the 1008
+            # websocket close when a key/voice is unauthorized) never silences the call —
+            # it drops to Cartesia (multilingual) or Deepgram instead of retrying into dead air.
+            fb = _cartesia_tts_obj() or _deepgram_tts_obj()
+            if fb is not None:
+                try:
+                    from livekit.agents.tts import FallbackAdapter
+                    _log("TTS: ElevenLabs → Cartesia/Deepgram fail-over (FallbackAdapter)")
+                    return FallbackAdapter([primary, fb])
+                except Exception as e:
+                    _log(f"FallbackAdapter unavailable ({type(e).__name__}: {e}); ElevenLabs alone")
+            return primary
 
     if provider == "cartesia" and settings.CARTESIA_API_KEY:
         try:
@@ -327,10 +366,20 @@ def _build_elevenlabs_ar_tts():
         return None
     try:
         _log(f"Arabic TTS: ElevenLabs {settings.ELEVENLABS_MODEL} voice={settings.ELEVENLABS_VOICE_ID_AR}")
-        return _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_AR, language="ar")
+        primary = _elevenlabs_tts(settings.ELEVENLABS_VOICE_ID_AR, language="ar")
     except Exception as e:
         _log(f"Arabic ElevenLabs TTS unavailable ({type(e).__name__}: {e}); Arabic falls back to English")
         return None
+    # Fail-over so an ElevenLabs error on the Arabic path drops to Cartesia-Arabic (or Deepgram)
+    # instead of silence.
+    fb = _build_cartesia_ar_tts() or _deepgram_tts_obj()
+    if fb is not None:
+        try:
+            from livekit.agents.tts import FallbackAdapter
+            return FallbackAdapter([primary, fb])
+        except Exception:
+            pass
+    return primary
 
 
 def _build_ar_tts():
