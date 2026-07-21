@@ -23,6 +23,16 @@ class Settings(BaseSettings):
     # wrong business is worse than not answering). Set True ONLY to restore the old
     # single-tenant behavior where any unmatched call falls back to the default tenant.
     ALLOW_DEFAULT_TENANT_FALLBACK: bool = False
+    # ── Demo call routing (dashboard-friendly, fully reversible) ─────────────────
+    # Which business answers DEMO_CALLABLE_NUMBER, applied idempotently on every boot:
+    #   ""           -> leave routing exactly as-is (default; touches nothing)
+    #   "divinia"    -> point the number at the Divinia clinic (also fills Divinia's FAQ
+    #                   knowledge base + SAR currency if missing)
+    #   "restaurant" -> point the number back at the live restaurant tenant
+    # Set this in the Railway dashboard and redeploy — reverting is one variable change.
+    # NOTHING is deleted; only which tenant owns the number changes.
+    ACTIVE_DEMO_TENANT: str = ""
+    DEMO_CALLABLE_NUMBER: str = "+16575347796"
     DEEPGRAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
     # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | elevenlabs | openai.

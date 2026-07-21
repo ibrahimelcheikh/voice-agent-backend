@@ -216,3 +216,59 @@ async def seed_atlasprimex_demo():
 
         await db.commit()
         print("[seed] AtlasPrimeX demo fleet seeded (operator + 6 tenants + Divinia data + alerts/tickets)")
+
+
+async def apply_call_number_switch(db, target: str, number: str) -> str:
+    """Point `number` at a demo tenant. Idempotent, additive, non-destructive: it only frees
+    the number from its current holder (sets that field NULL) and assigns it to the target.
+    `divinia` also fills Divinia's FAQ KB + SAR currency if missing. Does NOT commit — the
+    caller commits. Returns a human-readable status string. Shared by the boot hook and the
+    scripts/switch_call_number.py CLI so both behave identically."""
+    number = (number or "").strip()
+    if target not in ("divinia", "restaurant") or not number:
+        return f"no-op (target={target!r}, number={number!r})"
+    holders = (await db.execute(
+        select(Tenant).where(Tenant.twilio_phone_number == number))).scalars().all()
+
+    if target == "divinia":
+        div = await db.get(Tenant, DIVINIA_ID)
+        if not div:
+            return f"Divinia tenant '{DIVINIA_ID}' not found — is the DB seeded?"
+        for t in holders:
+            if t.id != DIVINIA_ID:
+                t.twilio_phone_number = None
+        await db.flush()   # release the number before reassigning (UNIQUE column)
+        div.twilio_phone_number = number
+        if not (div.knowledge_base or {}):
+            div.knowledge_base = _DIVINIA_KB
+        cfg = dict(div.config or {})
+        if cfg.get("currency") != "SAR":
+            cfg["currency"] = "SAR"
+            div.config = cfg
+        return f"{number} -> Divinia Clinic ({DIVINIA_ID})"
+
+    # target == "restaurant": hand the number back to the live restaurant tenant.
+    rows = (await db.execute(select(Tenant).where(Tenant.niche == Niche.restaurant))).scalars().all()
+    rest = rows[0] if len(rows) == 1 else None
+    if not rest:
+        return ("restaurant tenant ambiguous/missing — use scripts/switch_call_number.py with "
+                "RESTAURANT_TENANT_ID set")
+    for t in holders:
+        if t.id != rest.id:
+            t.twilio_phone_number = None
+    await db.flush()   # release the number before reassigning (UNIQUE column)
+    rest.twilio_phone_number = number
+    return f"{number} -> {rest.business_name} ({rest.id})"
+
+
+async def run_boot_demo_switch():
+    """Startup hook: apply settings.ACTIVE_DEMO_TENANT to DEMO_CALLABLE_NUMBER. No-op (and
+    never raises into boot) when ACTIVE_DEMO_TENANT is blank."""
+    from app.core.config import settings
+    target = (settings.ACTIVE_DEMO_TENANT or "").strip().lower()
+    if not target:
+        return
+    async with AsyncSessionLocal() as db:
+        status = await apply_call_number_switch(db, target, settings.DEMO_CALLABLE_NUMBER)
+        await db.commit()
+        print(f"[boot-switch] ACTIVE_DEMO_TENANT={target}: {status}")
