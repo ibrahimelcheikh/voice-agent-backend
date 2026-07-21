@@ -92,6 +92,8 @@ class Appt {
   final String via;
   final String? id;      // backend appointment id (real data) — null for mock rows
   final String? status;  // booked | confirmed | rescheduled | cancelled | completed
+  final String? phone;   // caller number (real data)
+  final String? price;   // formatted service price, e.g. "900 SAR"
   const Appt({
     required this.name,
     required this.svc,
@@ -101,6 +103,8 @@ class Appt {
     required this.via,
     this.id,
     this.status,
+    this.phone,
+    this.price,
   });
 }
 

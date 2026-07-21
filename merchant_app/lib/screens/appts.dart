@@ -72,7 +72,10 @@ class ApptsScreen extends ConsumerWidget {
   Widget _apptCard(BuildContext context, WidgetRef ref, DashboardMerchantRepository? dash,
       Appt a, S s, String lang) {
     final cancelled = a.status == 'cancelled';
-    return AppCard(
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _showDetails(context, s, lang, a),
+      child: AppCard(
       padding: const EdgeInsets.all(18),
       child: Row(
         children: [
@@ -84,7 +87,7 @@ class ApptsScreen extends ConsumerWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Text(loc(a.day, lang), style: const TextStyle(color: AppColors.blueDeep, fontWeight: FontWeight.w800, fontSize: 12)),
-                Text(a.date, style: const TextStyle(color: AppColors.blueDeep, fontWeight: FontWeight.w900, fontSize: 22, height: 1)),
+                Text(_dayNum(a.date), style: const TextStyle(color: AppColors.blueDeep, fontWeight: FontWeight.w900, fontSize: 22, height: 1)),
               ],
             ),
           ),
@@ -138,6 +141,57 @@ class ApptsScreen extends ConsumerWidget {
               ],
             ),
         ],
+      ),
+      ),
+    );
+  }
+
+  String _dayNum(String date) {
+    final d = DateTime.tryParse(date);
+    return d != null ? '${d.day}' : date;
+  }
+
+  /// Readable English date, e.g. "Wed, 5 Aug 2026". Falls back to the raw string.
+  String _fullDate(String date) {
+    final d = DateTime.tryParse(date);
+    if (d == null) return date;
+    const wk = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    const mo = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return '${wk[d.weekday - 1]}, ${d.day} ${mo[d.month - 1]} ${d.year}';
+  }
+
+  void _showDetails(BuildContext context, S s, String lang, Appt a) {
+    Widget row(IconData ic, String label, String? value) {
+      if (value == null || value.isEmpty) return const SizedBox.shrink();
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 7),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Icon(ic, size: 18, color: AppColors.sub),
+          const SizedBox(width: 12),
+          SizedBox(width: 92, child: Text(label, style: const TextStyle(color: AppColors.sub, fontWeight: FontWeight.w700, fontSize: 13.5))),
+          Expanded(child: Text(value, style: const TextStyle(color: AppColors.ink, fontWeight: FontWeight.w700, fontSize: 15))),
+        ]),
+      );
+    }
+
+    showDialog(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        backgroundColor: AppColors.card,
+        title: Text(a.name.isEmpty ? s.v('apptsTitle') : a.name),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            row(Icons.spa_outlined, s.v('fService'), loc(a.svc, lang)),
+            row(Icons.payments_outlined, s.v('bookings'), a.price),
+            row(Icons.person_outline, s.v('fName'), a.name),
+            row(Icons.phone_outlined, s.v('fPhone'), a.phone),
+            row(Icons.event_outlined, 'Date', _fullDate(a.date)),
+            row(Icons.access_time, 'Time', a.time),
+            row(Icons.verified_outlined, 'Status', a.status == null ? null : s.v(a.status!)),
+            row(Icons.auto_awesome, 'Booked via', a.via),
+          ]),
+        ),
+        actions: [TextButton(onPressed: () => Navigator.of(dctx).pop(), child: Text(s.v('cancel')))],
       ),
     );
   }

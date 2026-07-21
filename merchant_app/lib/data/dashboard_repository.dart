@@ -124,6 +124,8 @@ class DashboardMerchantRepository implements MerchantRepository {
       time: (m['time'] ?? '').toString(),
       via: (m['via'] ?? 'voice').toString(),
       status: m['status']?.toString(),
+      phone: m['phone']?.toString(),
+      price: m['price']?.toString(),
     );
   }
 
