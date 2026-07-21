@@ -45,6 +45,23 @@ def _local(dt, tz: ZoneInfo):
     return dt.astimezone(tz)
 
 
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _display_dt(dt, tz: ZoneInfo):
+    """Human time in the clinic's timezone: '1:12 PM' for today, else 'Jul 20, 1:12 PM'.
+    Call timestamps are stored in UTC, so this converts them to local clinic time for display."""
+    lc = _local(dt, tz)
+    if lc is None:
+        return None
+    h = lc.hour % 12 or 12
+    ap = "AM" if lc.hour < 12 else "PM"
+    t = f"{h}:{lc.minute:02d} {ap}"
+    if lc.date() == datetime.now(tz).date():
+        return t
+    return f"{_MONTHS[lc.month - 1]} {lc.day}, {t}"
+
+
 # ── Summary (Overview counts) ────────────────────────────────────────────────
 @router.get("/tenants/{slug}/summary")
 async def summary(slug: str, db: AsyncSession = Depends(get_db)):
@@ -87,6 +104,7 @@ async def summary(slug: str, db: AsyncSession = Depends(get_db)):
 async def conversations(slug: str, limit: int = 40, db: AsyncSession = Depends(get_db)):
     t = await _tenant_or_404(db, slug)
     currency = (t.config or {}).get("currency")
+    tz = _tz(t)
     calls = (await db.execute(
         select(Call).where(Call.tenant_id == slug).order_by(Call.started_at.desc()).limit(limit)
     )).scalars().all()
@@ -115,7 +133,7 @@ async def conversations(slug: str, limit: int = 40, db: AsyncSession = Depends(g
         items.append({
             "id": c.id,
             "caller_number": c.caller_number,
-            "time": c.started_at.isoformat() if c.started_at else None,
+            "time": _display_dt(c.started_at, tz) or "",
             "language": c.language,
             "duration_seconds": c.duration_seconds,
             "summary": summary,
