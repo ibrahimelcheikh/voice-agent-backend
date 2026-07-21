@@ -108,6 +108,25 @@ _TICKETS = [
 _HOURS = {d: "1:00 PM → 9:00 PM" for d in ["sat", "sun", "mon", "tue", "wed", "thu"]}
 _HOURS["fri"] = "Closed"
 
+# Divinia FAQ knowledge base — the ONLY source faq_lookup may answer non-service questions
+# from (keyword-matched by the agent). Service prices are also answered from the Service rows
+# via the services_offered intent; this KB covers everything else the agent must handle.
+_DIVINIA_KB = {
+    "hours": "We're open Saturday to Thursday, 1:00 PM to 9:00 PM. We are closed on Fridays.",
+    "location": "Divinia Clinic — Olaya, on Olaya Street, Riyadh 12211.",
+    "booking": ("You can book right now by phone — just tell me the service, the day, and the "
+                "time, and I'll confirm it and send an SMS confirmation."),
+    "rescheduling and cancellation": ("To reschedule or cancel an existing appointment, tell me "
+                                      "your name and I'll update or cancel your booking."),
+    "botox price": "Botox starts from 900 SAR per area (two areas 1,600 SAR, three areas 2,200 SAR).",
+    "filler duration": "Dermal fillers typically last 9 to 12 months.",
+    "female doctors": "Yes — female doctors are available on request; just let us know when booking.",
+    "laser preparation": ("For laser hair removal, shave the area 24 hours before your session, "
+                          "and avoid sun exposure or tanning for two weeks beforehand."),
+    "aftercare": ("After a treatment, avoid heat, direct sun, and strenuous exercise for 24 to 48 hours."),
+    "payment": "We accept cash, mada, and major cards. Prices are in Saudi riyals (SAR).",
+}
+
 
 async def seed_atlasprimex_demo():
     async with AsyncSessionLocal() as db:
@@ -133,8 +152,9 @@ async def seed_atlasprimex_demo():
                 greeting_message=f"Hello, welcome to {name}. How may I help you today?",
                 closed_greeting=(f"Thanks for calling {name}. We're currently closed, but I can "
                                  "schedule an appointment and we'll follow up during clinic hours."),
+                knowledge_base=(_DIVINIA_KB if tid == DIVINIA_ID else {}),
                 config={"city": city, "type": typ, "plan": plan, "status": status,
-                        "mrr": mrr, "health": health},
+                        "mrr": mrr, "health": health, "currency": "SAR"},
             ))
 
         # Merchant login scoped to Divinia.

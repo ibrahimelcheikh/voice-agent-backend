@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     ALLOW_DEFAULT_TENANT_FALLBACK: bool = False
     DEEPGRAM_API_KEY: str = ""
     CARTESIA_API_KEY: str = ""
-    # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | openai.
-    # Deepgram aura is lowest-latency but ENGLISH-ONLY; use cartesia for multilingual.
+    # Voice pipeline tuning (low latency). TTS_PROVIDER: deepgram | cartesia | elevenlabs | openai.
+    # Deepgram aura is lowest-latency but ENGLISH-ONLY; use cartesia or elevenlabs for multilingual.
+    # REVERT: switching providers is a single env var (e.g. back to "cartesia") — no code change.
     TTS_PROVIDER: str = "deepgram"
     DEEPGRAM_STT_MODEL: str = "nova-2-general"
     # Arabic STT (Phase 3b) — Deepgram with a monolingual Arabic language code (NOT multi). Nova-3
@@ -61,6 +62,15 @@ class Settings(BaseSettings):
     # CARTESIA_AR_VOICE is set, Arabic callers safely fall back to the English path.
     CARTESIA_AR_MODEL: str = "sonic-3.5"
     CARTESIA_AR_VOICE: str = ""  # REQUIRED for Arabic TTS; blank = Arabic falls back to English
+    # ── ElevenLabs TTS (alternative to Cartesia; used only when TTS_PROVIDER=elevenlabs) ──
+    # eleven_turbo_v2_5 is low-latency AND multilingual (supports Arabic); eleven_flash_v2_5
+    # is the lowest-latency multilingual option. Either is fine for phone.
+    # Blank voice ids fall back safely: EN -> next provider in the chain, AR -> English path,
+    # so a missing id never breaks a live call. Revert = set TTS_PROVIDER back to cartesia.
+    ELEVENLABS_API_KEY: str = ""
+    ELEVENLABS_MODEL: str = "eleven_turbo_v2_5"
+    ELEVENLABS_VOICE_ID_EN: str = ""  # English female voice id (from the ElevenLabs library)
+    ELEVENLABS_VOICE_ID_AR: str = ""  # Arabic female voice id; blank = Arabic falls back to English
     APP_HOST: str = "0.0.0.0"
     APP_PORT: int = 8030
     DEBUG: bool = True
