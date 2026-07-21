@@ -156,6 +156,10 @@ async def seed_atlasprimex_demo():
                 config={"city": city, "type": typ, "plan": plan, "status": status,
                         "mrr": mrr, "health": health, "currency": "SAR"},
             ))
+        # Materialize the tenants before inserting anything that FK-references them. Postgres
+        # enforces FKs mid-flush (SQLite does not), so without this the holidays/appointments
+        # for apx-divinia can be inserted before the tenant row and the whole seed rolls back.
+        await db.flush()
 
         # Merchant login scoped to Divinia.
         db.add(User(id="apx-merchant", tenant_id=DIVINIA_ID, role=UserRole.owner, name="Divinia Manager",
@@ -165,6 +169,7 @@ async def seed_atlasprimex_demo():
         db.add(Clinic(id="apx-divinia-branch", tenant_id=DIVINIA_ID, name="Divinia Clinic — Olaya",
                       address="Olaya St, Riyadh 12211, KSA", phone="+966 11 234 5678",
                       hours=_HOURS, timezone="Asia/Riyadh"))
+        await db.flush()   # branch must exist before services/patients/appointments FK to it
         bc = BehaviorConfig(id="apx-divinia-bc", tenant_id=DIVINIA_ID, name="Divinia prompt", version=1,
                             system_prompt=("You are the AI receptionist for Divinia Clinic, a med spa in "
                                            "Riyadh. Greet warmly and answer only from the clinic's real "
