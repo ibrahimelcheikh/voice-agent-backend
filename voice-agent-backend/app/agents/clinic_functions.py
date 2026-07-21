@@ -112,9 +112,10 @@ async def book_appointment(patient_name=None, phone=None, doctor=None, service=N
     require_tenant_id(tenant_id, "book_appointment")
     async with AsyncSessionLocal() as db:
         clinic = await _clinic(db, tenant_id)
-        if not phone or not patient_name or not date or not time:
+        # Service is required too, so the agent always asks which treatment before booking.
+        if not phone or not patient_name or not service or not date or not time:
             return {"success": False, "missing": [
-                k for k, v in {"patient_name": patient_name, "phone": phone,
+                k for k, v in {"patient_name": patient_name, "phone": phone, "service": service,
                                "date": date, "time": time}.items() if not v]}
 
         doc = await _match_doctor(db, doctor, tenant_id, clinic.id if clinic else None)

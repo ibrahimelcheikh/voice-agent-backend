@@ -978,6 +978,16 @@ async def _serve(room, behavior_config, call_id, started_at, *, is_worker,
             if name:
                 greeting = f"Hello {name.split()[0]}, " + greeting[0].lower() + greeting[1:]
             _log(f"recognized returning caller {name!r} ({phone})")
+        # Seed the caller's OWN number (from caller-ID) as the phone for every inbound call, so
+        # bookings capture the real number and the agent never asks for a number we already have.
+        try:
+            from app.services.tenant_service import sip_caller_number
+            _caller_num = sip_caller_number(room)
+        except Exception:
+            _caller_num = None
+        if _caller_num:
+            seed_entities = dict(seed_entities or {})
+            seed_entities.setdefault("phone", _caller_num)
 
     # Both agents are built from the SAME class + SAME shared config (instructions, guardrail
     # seed, tenant, niche, callbacks) — the business logic is never forked. They differ ONLY in
@@ -1188,7 +1198,11 @@ async def entrypoint(ctx):
         if not tenant_id:
             await _end_call_no_tenant(ctx, room_name)
             return
-        call_id = await _create_call_record(tenant_id, behavior_config, room_name, None)
+        # The SIP participant is present by now, so read the caller's real number (the number
+        # they're calling FROM) for the call record + dashboard, instead of "sip-caller".
+        from app.services.tenant_service import sip_caller_number
+        caller = sip_caller_number(ctx.room)
+        call_id = await _create_call_record(tenant_id, behavior_config, room_name, caller)
 
     await _serve(ctx.room, behavior_config, call_id, datetime.utcnow(), is_worker=True,
                  call_context=call_context, tenant_id=tenant_id)
